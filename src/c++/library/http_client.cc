@@ -763,7 +763,7 @@ InferResultHttp::InferResultHttp(
   if (infer_request->http_code_ == 499) {
     status_ = Error("Deadline Exceeded");
   } else {
-    std::fstream fs("/tmp/responses.log", fs.binary | fs.app);
+    std::fstream fs("/tmp/responses.log", "ab");
     fs << *infer_request->infer_response_buffer_ << std::endl << std::endl;
     if (offset != 0) {
       if (infer_request->verbose_) {
