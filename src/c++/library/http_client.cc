@@ -33,6 +33,7 @@
 #include <cstdint>
 #include <deque>
 #include <iostream>
+#include <fstream>
 #include "http_client.h"
 
 extern "C" {
