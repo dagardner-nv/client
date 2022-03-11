@@ -769,7 +769,7 @@ InferResultHttp::InferResultHttp(
   } else {
     g_call_count += 1;
     std::string fname{std::string("/tmp/response_body.") + std::to_string(g_call_count) + ".log"};
-    std::fstream fs(fname, fs.binary | fs.out);
+    std::fstream fs(fname, std::ios::binary | std::ios::out);
     fs << *infer_request->infer_response_buffer_ << std::endl << std::endl;
     if (offset != 0) {
       if (infer_request->verbose_) {
