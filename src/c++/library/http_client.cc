@@ -28,6 +28,7 @@
 #define TRITON_INFERENCE_SERVER_CLIENT_CLASS InferenceServerHttpClient
 #include "common.h"
 
+#include <atomic>
 #include <curl/curl.h>
 #include <zlib.h>
 #include <cstdint>
@@ -755,6 +756,8 @@ InferResultHttp::RequestStatus() const
   return status_;
 }
 
+std::atomic<unsigned> g_call_count{0};
+
 InferResultHttp::InferResultHttp(
     std::shared_ptr<HttpInferRequest> infer_request)
     : infer_request_(infer_request)
@@ -763,7 +766,9 @@ InferResultHttp::InferResultHttp(
   if (infer_request->http_code_ == 499) {
     status_ = Error("Deadline Exceeded");
   } else {
-    std::fstream fs("/tmp/responses.log", fs.binary | fs.app);
+    g_call_count += 1;
+    std::string fname{std::string("/tmp/response_body.") + std::to_string(g_call_count) + ".log"};
+    std::fstream fs(fname, fs.binary | fs.out);
     fs << *infer_request->infer_response_buffer_ << std::endl << std::endl;
     if (offset != 0) {
       if (infer_request->verbose_) {
