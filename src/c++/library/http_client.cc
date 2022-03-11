@@ -29,6 +29,7 @@
 #include "common.h"
 
 #include <atomic>
+#include <fstream>
 #include <string>
 #include <curl/curl.h>
 #include <zlib.h>
