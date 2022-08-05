@@ -1,5 +1,5 @@
 <!--
-# Copyright (c) 2021, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright 2021-2022, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 #
 # Redistribution and use in source and binary forms, with or without
 # modification, are permitted provided that the following conditions
@@ -52,10 +52,13 @@ The provided client libaries are:
 * The [protoc
   compiler](https://developers.google.com/protocol-buffers/docs/tutorials)
   can generate a GRPC API in a large number of programming
-  languages. See [src/grpc_generated/go](src/grpc_generated/go) for an
-  example for the [Go programming language](https://golang.org/). See
-  [src/grpc_generated/java](src/grpc_generated/java) for an example
-  for the Java and Scala programming languages.
+  languages.
+    * See [src/grpc_generated/go](src/grpc_generated/go) for an example for the
+    [Go programming language](https://golang.org/).
+    * See [src/grpc_generated/java](src/grpc_generated/java) for an example for
+    the Java and Scala programming languages.
+    * See [src/grpc_generated/javascript](src/grpc_generated/javascript) for
+    an example with JavaScript programming language.
 
 There are also many example applications that show how to use these
 libraries. Many of these examples use models from the [example model
@@ -105,7 +108,7 @@ release](#download-from-github), or [download a pre-built Docker image
 containing the client libraries](#download-docker-image-from-ngc) from
 [NVIDIA GPU Cloud (NGC)](https://ngc.nvidia.com).
 
-It is also possible to build build the client libraries with
+It is also possible to build the client libraries with
 [cmake](#build-using-cmake).
 
 ### Download Using Python Package Installer (pip)
@@ -204,6 +207,16 @@ corresponding headers in /workspace/install/include, and the Python
 wheel files in /workspace/install/python. The image will also contain
 the built client examples.
 
+**Important Note:** When running either the server or the client using
+Docker containers and using the
+[CUDA shared memory feature](https://github.com/triton-inference-server/server/blob/main/docs/protocol/extension_shared_memory.md#cuda-shared-memory)
+you need to add `--pid host` flag when launching the containers. The reason is
+that CUDA IPC APIs require the PID of the source and destination of the exported
+pointer to be different. Otherwise, Docker enables PID namespace which may
+result in equality between the source and destination PIDs. The error will be
+always observed when both of the containers are started in the non-interacive
+mode.
+
 ### Build Using CMake
 
 The client library build is performed using CMake. To build the client
@@ -229,12 +242,18 @@ because Triton on Windows does not yet support all the build options.
 
 #### Non-Windows
 
-Use *cmake* to configure the build.
+Use *cmake* to configure the build. You should adjust the flags depending on
+the components of Triton Client you are working and would like to build.
+For example, if you want to build Perf Analyzer with Triton C API, you can use \
+`-DTRITON_ENABLE_PERF_ANALYZER=ON -DTRITON_ENABLE_PERF_ANALYZER_C_API=ON`. You can
+also use `TRITON_ENABLE_PERF_ANALYZER_TFS` and `TRITON_ENABLE_PERF_ANALYZER_TS` flags
+to enable/disable support for TensorFlow Serving and TorchServe backend respectively in perf analyzer. \
+The following command demonstrate how to build client with all the features:
 
 ```
 $ mkdir build
 $ cd build
-$ cmake -DCMAKE_INSTALL_PREFIX=`pwd`/install -DTRITON_ENABLE_CC_HTTP=ON -DTRITON_ENABLE_CC_GRPC=ON -DTRITON_ENABLE_PERF_ANALYZER=ON -DTRITON_ENABLE_PYTHON_HTTP=ON -DTRITON_ENABLE_PYTHON_GRPC=ON -DTRITON_ENABLE_JAVA_HTTP=ON -DTRITON_ENABLE_GPU=ON -DTRITON_ENABLE_EXAMPLES=ON -DTRITON_ENABLE_TESTS=ON ..
+$ cmake -DCMAKE_INSTALL_PREFIX=`pwd`/install -DTRITON_ENABLE_CC_HTTP=ON -DTRITON_ENABLE_CC_GRPC=ON -DTRITON_ENABLE_PERF_ANALYZER=ON -DTRITON_ENABLE_PERF_ANALYZER_C_API=ON -DTRITON_ENABLE_PERF_ANALYZER_TFS=ON -DTRITON_ENABLE_PERF_ANALYZER_TS=ON -DTRITON_ENABLE_PYTHON_HTTP=ON -DTRITON_ENABLE_PYTHON_GRPC=ON -DTRITON_ENABLE_JAVA_HTTP=ON -DTRITON_ENABLE_GPU=ON -DTRITON_ENABLE_EXAMPLES=ON -DTRITON_ENABLE_TESTS=ON ..
 ```
 
 If you are building on a release branch (or on a development branch
@@ -330,6 +349,23 @@ to the [Java client directory](src/java).
 
 ### HTTP Options
 
+#### SSL/TLS
+
+The client library allows communication across a secured channel using HTTPS protocol. Just setting these SSL options do not ensure the secure communication. Triton server should be running behind `https://` proxy such as nginx. The client can then establish a secure channel to the proxy. The [`qa/L0_https`](https://github.com/triton-inference-server/server/blob/main/qa/L0_https/test.sh) in the server repository demonstrates how this can be acheived. 
+
+For C++ client, see `HttpSslOptions` struct that encapsulates these options in [http_client.h](src/c%2B%2B/library/http_client.h).
+
+For Python client, look for the following options in [http/\_\_init\_\_.py](src/python/library/tritonclient/http/__init__.py):
+
+* ssl
+* ssl_options
+* ssl_context_factory
+* insecure
+
+The [C++](src/c%2B%2B/examples/simple_http_infer_client.cc) and [Python](src/python/examples/simple_http_infer_client.py) examples
+demonstrates how to use SSL/TLS settings on client side.
+
+
 #### Compression
 
 The client library enables on-wire compression for HTTP transactions.
@@ -339,6 +375,17 @@ For C++ client, see `request_compression_algorithm` and `response_compression_al
 Similarly, for Python client, see `request_compression_algorithm` and `response_compression_algorithm` parameters in `infer`and `async_infer` functions in [http/\_\_init\_\_.py](src/python/library/tritonclient/http/__init__.py).
 
 The [C++](src/c%2B%2B/examples/simple_http_infer_client.cc) and [Python](src/python/examples/simple_http_infer_client.py) examples demonstrates how to use compression options.
+
+#### Python AsyncIO Support (Beta)
+
+*This feature is currently in beta and may be subject to change.*
+
+Advanced users may call the Python client via `async` and `await` syntax. The
+[infer](src/python/examples/simple_http_aio_infer_client.py) example 
+demonstrates how to infer with AsyncIO.
+
+If using SSL/TLS with AsyncIO, look for the `ssl` and `ssl_context` options in 
+[http/aio/\_\_init\_\_.py](src/python/library/tritonclient/http/aio/__init__.py)
 
 ### GRPC Options
 
@@ -383,6 +430,32 @@ There is also a [C++](src/c%2B%2B/examples/simple_grpc_keepalive_client.cc) and
 demonstrating how to setup these parameters on the client-side. For information
 on the corresponding server-side parameters, refer to the 
 [server documentation](https://github.com/triton-inference-server/server/blob/main/docs/inference_protocols.md#grpc-keepalive)
+
+#### Custom GRPC Channel Arguments
+
+Advanced users may require specific client-side GRPC Channel Arguments that are
+not currently exposed by Triton through direct means. To support this, Triton
+allows users to pass custom channel arguments upon creating a GRPC client. When
+using this option, it is up to the user to pass a valid combination of arguments
+for their use case; Triton cannot feasibly test every posisble combination of
+channel arguments.
+
+There is a [C++](src/c%2B%2B/examples/simple_grpc_custom_args_client.cc) and 
+[Python](src/python/examples/simple_grpc_custom_args_client.py) example
+demonstrating how to construct and pass these custom arguments upon creating
+a GRPC client.
+
+You can find a comprehensive list of possible GRPC Channel Arguments
+[here](https://grpc.github.io/grpc/core/group__grpc__arg__keys.html).
+
+#### Python AsyncIO Support (Beta)
+
+*This feature is currently in beta and may be subject to change.*
+
+Advanced users may call the Python client via `async` and `await` syntax. The 
+[infer](src/python/examples/simple_grpc_aio_infer_client.py) and 
+[stream](src/python/examples/simple_grpc_aio_sequence_stream_infer_client.py) 
+examples demonstrate how to infer with AsyncIO.
 
 ## Simple Example Applications
 

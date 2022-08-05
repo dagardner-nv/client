@@ -1,4 +1,4 @@
-// Copyright (c) 2020, NVIDIA CORPORATION. All rights reserved.
+// Copyright 2020-2022, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 //
 // Redistribution and use in source and binary forms, with or without
 // modification, are permitted provided that the following conditions
@@ -59,14 +59,16 @@ DataLoader::ReadDataFromDir(
       if (byte_size < 0) {
         return cb::Error(
             "input " + input.second.name_ +
-            " contains dynamic shape, provide shapes to send along with the "
-            "request");
+                " contains dynamic shape, provide shapes to send along with "
+                "the request",
+            pa::GENERIC_ERROR);
       }
       if (it->second.size() != byte_size) {
         return cb::Error(
             "provided data for input " + input.second.name_ +
-            " has byte size " + std::to_string(it->second.size()) +
-            ", expect " + std::to_string(byte_size));
+                " has byte size " + std::to_string(it->second.size()) +
+                ", expect " + std::to_string(byte_size),
+            pa::GENERIC_ERROR);
       }
     } else {
       const auto file_path = data_directory + "/" + input.second.name_;
@@ -81,14 +83,16 @@ DataLoader::ReadDataFromDir(
       if (batch1_num_strings == -1) {
         return cb::Error(
             "input " + input.second.name_ +
-            " contains dynamic shape, provide shapes to send along with the "
-            "request");
+                " contains dynamic shape, provide shapes to send along with "
+                "the request",
+            pa::GENERIC_ERROR);
       }
       if (input_string_data.size() != batch1_num_strings) {
         return cb::Error(
             "provided data for input " + input.second.name_ + " has " +
-            std::to_string(it->second.size()) + " byte elements, expect " +
-            std::to_string(batch1_num_strings));
+                std::to_string(it->second.size()) + " byte elements, expect " +
+                std::to_string(batch1_num_strings),
+            pa::GENERIC_ERROR);
       }
     }
   }
@@ -127,24 +131,28 @@ DataLoader::ReadDataFromJSON(
 {
   FILE* data_file = fopen(json_file.c_str(), "r");
   if (data_file == nullptr) {
-    return cb::Error("failed to open file for reading provided data");
+    return cb::Error(
+        "failed to open file for reading provided data", pa::GENERIC_ERROR);
   }
 
   char readBuffer[65536];
   rapidjson::FileReadStream fs(data_file, readBuffer, sizeof(readBuffer));
 
   rapidjson::Document d{};
-  d.ParseStream(fs);
+  const unsigned int parseFlags = rapidjson::kParseNanAndInfFlag;
+  d.ParseStream<parseFlags>(fs);
 
   if (d.HasParseError()) {
     std::cerr << "cb::Error  : " << d.GetParseError() << '\n'
               << "Offset : " << d.GetErrorOffset() << '\n';
     return cb::Error(
-        "failed to parse the specified json file for reading provided data");
+        "failed to parse the specified json file for reading provided data",
+        pa::GENERIC_ERROR);
   }
 
   if (!d.HasMember("data")) {
-    return cb::Error("The json file doesn't contain data field");
+    return cb::Error(
+        "The json file doesn't contain data field", pa::GENERIC_ERROR);
   }
 
   const rapidjson::Value& streams = d["data"];
@@ -156,7 +164,8 @@ DataLoader::ReadDataFromJSON(
     if (out_streams->Size() != streams.Size()) {
       return cb::Error(
           "The 'validation_data' field doesn't align with 'data' field in the "
-          "json file");
+          "json file",
+          pa::GENERIC_ERROR);
     }
   }
 
@@ -179,7 +188,8 @@ DataLoader::ReadDataFromJSON(
             (output_steps->Size() != steps.Size())) {
           return cb::Error(
               "The 'validation_data' field doesn't align with 'data' field in "
-              "the json file");
+              "the json file",
+              pa::GENERIC_ERROR);
         }
         for (size_t k = 0; k < step_num_[i]; k++) {
           RETURN_IF_ERROR(
@@ -233,7 +243,8 @@ DataLoader::GenerateData(
     if (input.second.is_shape_tensor_) {
       return cb::Error(
           "can not generate data for shape tensor '" + input.second.name_ +
-          "', user-provided data is needed.");
+              "', user-provided data is needed.",
+          pa::GENERIC_ERROR);
     }
   }
 
@@ -244,8 +255,9 @@ DataLoader::GenerateData(
       if (byte_size < 0) {
         return cb::Error(
             "input " + input.second.name_ +
-            " contains dynamic shape, provide shapes to send along with the "
-            "request");
+                " contains dynamic shape, provide shapes to send along with "
+                "the request",
+            pa::GENERIC_ERROR);
       }
       max_input_byte_size = std::max(max_input_byte_size, (size_t)byte_size);
     } else {
@@ -255,8 +267,9 @@ DataLoader::GenerateData(
       if (batch1_num_strings == -1) {
         return cb::Error(
             "input " + input.second.name_ +
-            " contains dynamic shape, provide shapes to send along with the "
-            "request");
+                " contains dynamic shape, provide shapes to send along with "
+                "the request",
+            pa::GENERIC_ERROR);
       }
       input_string_data.resize(batch1_num_strings);
       if (!string_data.empty()) {
@@ -299,20 +312,24 @@ DataLoader::GetInputData(
     const ModelTensor& input, const int stream_id, const int step_id,
     const uint8_t** data_ptr, size_t* batch1_size)
 {
+  bool data_found = false;
+
   // If json data is available then try to retrieve the data from there
   if (!input_data_.empty()) {
     // validate if the indices conform to the vector sizes
     if (stream_id < 0 || stream_id >= (int)data_stream_cnt_) {
       return cb::Error(
           "stream_id for retrieving the data should be less than " +
-          std::to_string(data_stream_cnt_) + ", got " +
-          std::to_string(stream_id));
+              std::to_string(data_stream_cnt_) + ", got " +
+              std::to_string(stream_id),
+          pa::GENERIC_ERROR);
     }
     if (step_id < 0 || step_id >= (int)step_num_[stream_id]) {
       return cb::Error(
           "step_id for retrieving the data should be less than " +
-          std::to_string(step_num_[stream_id]) + ", got " +
-          std::to_string(step_id));
+              std::to_string(step_num_[stream_id]) + ", got " +
+              std::to_string(step_id),
+          pa::GENERIC_ERROR);
     }
     std::string key_name(
         input.name_ + "_" + std::to_string(stream_id) + "_" +
@@ -328,23 +345,30 @@ DataLoader::GetInputData(
         *batch1_size = string_data->size();
       }
       *data_ptr = (const uint8_t*)&((it->second)[0]);
-    } else {
-      return cb::Error(
-          "unable to find data for input '" + input.name_ +
-          "' in provided data.");
+      data_found = true;
     }
-  } else if (
-      (input.datatype_.compare("BYTES") != 0) && (input_buf_.size() != 0)) {
-    int64_t byte_size = ByteSize(input.shape_, input.datatype_);
-    if (byte_size < 0) {
-      return cb::Error(
-          "failed to get correct byte size for '" + input.name_ + "'.");
-    }
-    *batch1_size = (size_t)byte_size;
-    *data_ptr = &input_buf_[0];
-  } else {
-    return cb::Error("unable to find data for input '" + input.name_ + "'.");
   }
+
+  if (!data_found) {
+    if ((input.datatype_.compare("BYTES") != 0) && (input_buf_.size() != 0)) {
+      int64_t byte_size = ByteSize(input.shape_, input.datatype_);
+      if (byte_size < 0) {
+        return cb::Error(
+            "failed to get correct byte size for '" + input.name_ + "'.",
+            pa::GENERIC_ERROR);
+      }
+      *batch1_size = (size_t)byte_size;
+      *data_ptr = &input_buf_[0];
+      data_found = true;
+    }
+  }
+
+  if (input.is_optional_ == false && !data_found) {
+    return cb::Error(
+        "unable to find data for input '" + input.name_ + "'.",
+        pa::GENERIC_ERROR);
+  }
+
   return cb::Error::Success;
 }
 
@@ -361,14 +385,16 @@ DataLoader::GetOutputData(
     if (stream_id < 0 || stream_id >= (int)data_stream_cnt_) {
       return cb::Error(
           "stream_id for retrieving the data should be less than " +
-          std::to_string(data_stream_cnt_) + ", got " +
-          std::to_string(stream_id));
+              std::to_string(data_stream_cnt_) + ", got " +
+              std::to_string(stream_id),
+          pa::GENERIC_ERROR);
     }
     if (step_id < 0 || step_id >= (int)step_num_[stream_id]) {
       return cb::Error(
           "step_id for retrieving the data should be less than " +
-          std::to_string(step_num_[stream_id]) + ", got " +
-          std::to_string(step_id));
+              std::to_string(step_num_[stream_id]) + ", got " +
+              std::to_string(step_id),
+          pa::GENERIC_ERROR);
     }
     std::string key_name(
         output_name + "_" + std::to_string(stream_id) + "_" +
@@ -425,6 +451,11 @@ DataLoader::ReadTensorData(
 
       const rapidjson::Value* content;
 
+      // Check if the input data file is malformed
+      if (!(tensor.IsArray() || tensor.IsObject())) {
+        return cb::Error("Input data file is malformed.", pa::GENERIC_ERROR);
+      }
+
       if (tensor.IsArray()) {
         content = &tensor;
       } else if (tensor.HasMember("b64")) {
@@ -436,7 +467,8 @@ DataLoader::ReadTensorData(
               tensor_shape.emplace(key_name, std::vector<int64_t>()).first;
           for (const auto& value : tensor["shape"].GetArray()) {
             if (!value.IsInt()) {
-              return cb::Error("shape values must be integers.");
+              return cb::Error(
+                  "shape values must be integers.", pa::GENERIC_ERROR);
             }
             shape_it->second.push_back(value.GetInt());
           }
@@ -445,8 +477,9 @@ DataLoader::ReadTensorData(
         if (!tensor.HasMember("content")) {
           return cb::Error(
               "missing content field. ( Location stream id: " +
-              std::to_string(stream_index) +
-              ", step id: " + std::to_string(step_index) + ")");
+                  std::to_string(stream_index) +
+                  ", step id: " + std::to_string(step_index) + ")",
+              pa::GENERIC_ERROR);
         }
 
         content = &tensor["content"];
@@ -476,25 +509,28 @@ DataLoader::ReadTensorData(
               return cb::Error(
                   "mismatch in the data provided. "
                   "Expected: " +
-                  std::to_string(batch1_byte) +
-                  " bytes, Got: " + std::to_string(it->second.size()) +
-                  " bytes ( Location stream id: " +
-                  std::to_string(stream_index) +
-                  ", step id: " + std::to_string(step_index) + ")");
+                      std::to_string(batch1_byte) +
+                      " bytes, Got: " + std::to_string(it->second.size()) +
+                      " bytes ( Location stream id: " +
+                      std::to_string(stream_index) +
+                      ", step id: " + std::to_string(step_index) + ")",
+                  pa::GENERIC_ERROR);
             }
           } else {
             return cb::Error(
                 "the value of b64 field should be of type string ( "
                 "Location stream id: " +
-                std::to_string(stream_index) +
-                ", step id: " + std::to_string(step_index) + ")");
+                    std::to_string(stream_index) +
+                    ", step id: " + std::to_string(step_index) + ")",
+                pa::GENERIC_ERROR);
           }
         } else {
           return cb::Error(
               "The tensor values are not supported. Expected an array or "
               "b64 string ( Location stream id: " +
-              std::to_string(stream_index) +
-              ", step id: " + std::to_string(step_index) + ")");
+                  std::to_string(stream_index) +
+                  ", step id: " + std::to_string(step_index) + ")",
+              pa::GENERIC_ERROR);
         }
       }
 
@@ -509,13 +545,15 @@ DataLoader::ReadTensorData(
       if (element_count < 0) {
         return cb::Error(
             "The variable-sized tensor \"" + io.second.name_ +
-            "\" is missing shape, see --shape option.");
+                "\" is missing shape, see --shape option.",
+            pa::GENERIC_ERROR);
       }
-    } else {
+    } else if (io.second.is_optional_ == false) {
       return cb::Error(
           "missing tensor " + io.first +
-          " ( Location stream id: " + std::to_string(stream_index) +
-          ", step id: " + std::to_string(step_index) + ")");
+              " ( Location stream id: " + std::to_string(stream_index) +
+              ", step id: " + std::to_string(step_index) + ")",
+          pa::GENERIC_ERROR);
     }
   }
 

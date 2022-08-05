@@ -1,4 +1,4 @@
-// Copyright (c) 2020, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// Copyright 2020-2022, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 //
 // Redistribution and use in source and binary forms, with or without
 // modification, are permitted provided that the following conditions
@@ -28,7 +28,6 @@
 #define TRITON_INFERENCE_SERVER_CLIENT_CLASS InferenceServerGrpcClient
 #include "common.h"
 
-#include <grpcpp/grpcpp.h>
 #include <chrono>
 #include <cstdint>
 #include <fstream>
@@ -43,11 +42,12 @@ namespace {
 
 //==============================================================================
 
-// Use map to keep track of GRPC channels. <key, value> : <url, Channel*>
-// If context is created on url that has established Channel, then reuse it.
+// Use map to keep track of GRPC channels. <key, value> : <url, <shared_count,
+// Channel*, Stub*>> If context is created on url that has established Channel
+// and hasn't reached max shared count, then reuse it.
 std::map<
-    std::string, std::pair<
-                     std::shared_ptr<grpc::Channel>,
+    std::string, std::tuple<
+                     size_t, std::shared_ptr<grpc::Channel>,
                      std::shared_ptr<inference::GRPCInferenceService::Stub>>>
     grpc_channel_stub_map_;
 std::mutex grpc_channel_stub_map_mtx_;
@@ -75,12 +75,11 @@ ReadFile(const std::string& filename, std::string& data)
   }
 }
 
-std::pair<
-    std::shared_ptr<grpc::Channel>,
-    std::shared_ptr<inference::GRPCInferenceService::Stub>>
-GetChannelStub(
+std::shared_ptr<inference::GRPCInferenceService::Stub>
+GetStub(
     const std::string& url, bool use_ssl, const SslOptions& ssl_options,
-    const KeepAliveOptions& keepalive_options)
+    const grpc::ChannelArguments& channel_args, const bool use_cached_channel,
+    bool verbose)
 {
   std::lock_guard<std::mutex> lock(grpc_channel_stub_map_mtx_);
 
@@ -91,51 +90,58 @@ GetChannelStub(
   static const size_t max_share_count =
       std::stoul(GetEnvironmentVariableOrDefault(
           "TRITON_CLIENT_GRPC_CHANNEL_MAX_SHARE_COUNT", "6"));
-  static std::atomic<int> channel_count{0};
-  auto current_idx = channel_count.fetch_add(1);
-  const auto& channel_itr = grpc_channel_stub_map_.find(
-      url + std::to_string(current_idx / max_share_count));
-  if (channel_itr != grpc_channel_stub_map_.end()) {
-    return channel_itr->second;
-  } else {
-    grpc::ChannelArguments arguments;
-    arguments.SetMaxSendMessageSize(MAX_GRPC_MESSAGE_SIZE);
-    arguments.SetMaxReceiveMessageSize(MAX_GRPC_MESSAGE_SIZE);
-    // GRPC KeepAlive: https://github.com/grpc/grpc/blob/master/doc/keepalive.md
-    arguments.SetInt(
-        GRPC_ARG_KEEPALIVE_TIME_MS, keepalive_options.keepalive_time_ms);
-    arguments.SetInt(
-        GRPC_ARG_KEEPALIVE_TIMEOUT_MS, keepalive_options.keepalive_timeout_ms);
-    arguments.SetInt(
-        GRPC_ARG_KEEPALIVE_PERMIT_WITHOUT_CALLS,
-        keepalive_options.keepalive_permit_without_calls);
-    arguments.SetInt(
-        GRPC_ARG_HTTP2_MAX_PINGS_WITHOUT_DATA,
-        keepalive_options.http2_max_pings_without_data);
-    arguments.SetInt("client_channel_idx", current_idx);
-    std::shared_ptr<grpc::ChannelCredentials> credentials;
-    if (use_ssl) {
-      std::string root;
-      std::string key;
-      std::string cert;
-      ReadFile(ssl_options.root_certificates, root);
-      ReadFile(ssl_options.private_key, key);
-      ReadFile(ssl_options.certificate_chain, cert);
-      grpc::SslCredentialsOptions opts = {root, key, cert};
-      credentials = grpc::SslCredentials(opts);
-    } else {
-      credentials = grpc::InsecureChannelCredentials();
+  const auto& channel_itr = grpc_channel_stub_map_.find(url);
+  // Reuse cached channel if the channel is found in the map and
+  // used_cached_channel flag is true
+  if ((channel_itr != grpc_channel_stub_map_.end()) && use_cached_channel) {
+    // check if NewStub should be created
+    const auto& shared_count = std::get<0>(channel_itr->second);
+    if (shared_count % max_share_count != 0) {
+      std::get<0>(channel_itr->second)++;
+      return std::get<2>(channel_itr->second);
     }
-    std::shared_ptr<grpc::Channel> channel =
-        grpc::CreateCustomChannel(url, credentials, arguments);
-    std::shared_ptr<inference::GRPCInferenceService::Stub> stub =
-        inference::GRPCInferenceService::NewStub(channel);
-    grpc_channel_stub_map_.insert(std::make_pair(
-        url + std::to_string(current_idx / max_share_count),
-        std::make_pair(channel, stub)));
-
-    return std::make_pair(channel, stub);
   }
+
+  if (verbose) {
+    std::cout << "Creating new channel with url:" << url << std::endl;
+  }
+
+  // Start with a copy of channel_args param, then modify our copy as needed.
+  grpc::ChannelArguments arguments(channel_args);
+
+  static std::atomic<int> channel_count{0};
+  // Explicitly avoid channel re-use
+  // "channels must have different channel args to prevent re-use
+  // so define a use-specific channel arg such as channel number"
+  // https://grpc.io/docs/guides/performance/
+  // NOTE: The argument name "triton_client_channel_idx" is arbitrary.
+  arguments.SetInt("triton_client_channel_idx", channel_count.fetch_add(1));
+  std::shared_ptr<grpc::ChannelCredentials> credentials;
+  if (use_ssl) {
+    std::string root;
+    std::string key;
+    std::string cert;
+    ReadFile(ssl_options.root_certificates, root);
+    ReadFile(ssl_options.private_key, key);
+    ReadFile(ssl_options.certificate_chain, cert);
+    grpc::SslCredentialsOptions opts = {root, key, cert};
+    credentials = grpc::SslCredentials(opts);
+  } else {
+    credentials = grpc::InsecureChannelCredentials();
+  }
+  std::shared_ptr<grpc::Channel> channel =
+      grpc::CreateCustomChannel(url, credentials, arguments);
+  std::shared_ptr<inference::GRPCInferenceService::Stub> stub =
+      inference::GRPCInferenceService::NewStub(channel);
+  // Replace if channel / stub have been in the map
+  if (channel_itr != grpc_channel_stub_map_.end()) {
+    channel_itr->second = std::make_tuple(1, channel, stub);
+  } else {
+    grpc_channel_stub_map_.insert(
+        std::make_pair(url, std::make_tuple(1, channel, stub)));
+  }
+
+  return stub;
 }
 }  // namespace
 
@@ -384,14 +390,53 @@ InferResultGrpc::InferResultGrpc(
 
 //==============================================================================
 
+// Advanced users can generically pass any channel arguments
+// through the channel_args parameter, including KeepAlive options.
+// Channel arguments provided by the user are at the user's own risk and
+// are assumed to be correct/complete.
+Error
+InferenceServerGrpcClient::Create(
+    std::unique_ptr<InferenceServerGrpcClient>* client,
+    const std::string& server_url, const grpc::ChannelArguments& channel_args,
+    bool verbose, bool use_ssl, const SslOptions& ssl_options,
+    const bool use_cached_channel)
+{
+  client->reset(new InferenceServerGrpcClient(
+      server_url, verbose, use_ssl, ssl_options, channel_args,
+      use_cached_channel));
+  return Error::Success;
+}
+
+// Most users should use this method of creating a client unless
+// they have an advanced use case that is not supported.
 Error
 InferenceServerGrpcClient::Create(
     std::unique_ptr<InferenceServerGrpcClient>* client,
     const std::string& server_url, bool verbose, bool use_ssl,
-    const SslOptions& ssl_options, const KeepAliveOptions& keepalive_options)
+    const SslOptions& ssl_options, const KeepAliveOptions& keepalive_options,
+    const bool use_cached_channel)
 {
+  // Construct channel channel_args specific to Triton
+  grpc::ChannelArguments channel_args;
+
+  channel_args.SetMaxSendMessageSize(MAX_GRPC_MESSAGE_SIZE);
+  channel_args.SetMaxReceiveMessageSize(MAX_GRPC_MESSAGE_SIZE);
+
+  // GRPC KeepAlive: https://github.com/grpc/grpc/blob/master/doc/keepalive.md
+  channel_args.SetInt(
+      GRPC_ARG_KEEPALIVE_TIME_MS, keepalive_options.keepalive_time_ms);
+  channel_args.SetInt(
+      GRPC_ARG_KEEPALIVE_TIMEOUT_MS, keepalive_options.keepalive_timeout_ms);
+  channel_args.SetInt(
+      GRPC_ARG_KEEPALIVE_PERMIT_WITHOUT_CALLS,
+      keepalive_options.keepalive_permit_without_calls);
+  channel_args.SetInt(
+      GRPC_ARG_HTTP2_MAX_PINGS_WITHOUT_DATA,
+      keepalive_options.http2_max_pings_without_data);
+
   client->reset(new InferenceServerGrpcClient(
-      server_url, verbose, use_ssl, ssl_options, keepalive_options));
+      server_url, verbose, use_ssl, ssl_options, channel_args,
+      use_cached_channel));
   return Error::Success;
 }
 
@@ -602,7 +647,9 @@ InferenceServerGrpcClient::ModelRepositoryIndex(
 
 Error
 InferenceServerGrpcClient::LoadModel(
-    const std::string& model_name, const Headers& headers)
+    const std::string& model_name, const Headers& headers,
+    const std::string& config,
+    const std::map<std::string, std::vector<char>>& files)
 {
   Error err;
 
@@ -615,6 +662,13 @@ InferenceServerGrpcClient::LoadModel(
   }
 
   request.set_model_name(model_name);
+  if (!config.empty()) {
+    (*request.mutable_parameters())["config"].set_string_param(config);
+  }
+  for (const auto& file : files) {
+    (*request.mutable_parameters())[file.first].set_bytes_param(
+        file.second.data(), file.second.size());
+  }
   grpc::Status grpc_status =
       stub_->RepositoryModelLoad(&context, request, &response);
   if (!grpc_status.ok()) {
@@ -679,6 +733,77 @@ InferenceServerGrpcClient::ModelInferenceStatistics(
   if (grpc_status.ok()) {
     if (verbose_) {
       std::cout << infer_stat->DebugString() << std::endl;
+    }
+  } else {
+    err = Error(grpc_status.error_message());
+  }
+
+  return err;
+}
+
+Error
+InferenceServerGrpcClient::UpdateTraceSettings(
+    inference::TraceSettingResponse* response, const std::string& model_name,
+    const std::map<std::string, std::vector<std::string>>& settings,
+    const Headers& headers)
+{
+  inference::TraceSettingRequest request;
+  grpc::ClientContext context;
+  Error err;
+
+  for (const auto& it : headers) {
+    context.AddMetadata(it.first, it.second);
+  }
+
+  if (!model_name.empty()) {
+    request.set_model_name(model_name);
+  }
+  if (!settings.empty()) {
+    for (const auto& pr : settings) {
+      if (pr.second.empty()) {
+        (*request.mutable_settings())[pr.first].clear_value();
+      } else {
+        for (const auto& v : pr.second) {
+          (*request.mutable_settings())[pr.first].add_value(v);
+        }
+      }
+    }
+  }
+  grpc::Status grpc_status = stub_->TraceSetting(&context, request, response);
+  if (grpc_status.ok()) {
+    if (verbose_) {
+      std::cout << "Update trace settings " << response->DebugString()
+                << std::endl;
+    }
+  } else {
+    err = Error(grpc_status.error_message());
+  }
+
+  return err;
+}
+
+Error
+InferenceServerGrpcClient::GetTraceSettings(
+    inference::TraceSettingResponse* settings, const std::string& model_name,
+    const Headers& headers)
+{
+  settings->Clear();
+  Error err;
+
+  inference::TraceSettingRequest request;
+  grpc::ClientContext context;
+
+  for (const auto& it : headers) {
+    context.AddMetadata(it.first, it.second);
+  }
+
+  if (!model_name.empty()) {
+    request.set_model_name(model_name);
+  }
+  grpc::Status grpc_status = stub_->TraceSetting(&context, request, settings);
+  if (grpc_status.ok()) {
+    if (verbose_) {
+      std::cout << settings->DebugString() << std::endl;
     }
   } else {
     err = Error(grpc_status.error_message());
@@ -997,6 +1122,116 @@ InferenceServerGrpcClient::AsyncInfer(
       std::cout << " '" << options.request_id_ << "'";
     }
     std::cout << std::endl;
+  }
+
+  return Error::Success;
+}
+
+Error
+InferenceServerGrpcClient::InferMulti(
+    std::vector<InferResult*>* results,
+    const std::vector<InferOptions>& options,
+    const std::vector<std::vector<InferInput*>>& inputs,
+    const std::vector<std::vector<const InferRequestedOutput*>>& outputs,
+    const Headers& headers, grpc_compression_algorithm compression_algorithm)
+{
+  Error err;
+
+  // Sanity check
+  if ((inputs.size() != options.size()) && (options.size() != 1)) {
+    return Error(
+        "'options' must either contain 1 element or match size of 'inputs'");
+  }
+  if ((inputs.size() != outputs.size()) &&
+      ((outputs.size() != 1) && (outputs.size() != 0))) {
+    return Error(
+        "'outputs' must either contain 0/1 element or match size of 'inputs'");
+  }
+
+  int64_t max_option_idx = options.size() - 1;
+  // value of '-1' means no output is specified
+  int64_t max_output_idx = outputs.size() - 1;
+  static std::vector<const InferRequestedOutput*> empty_outputs{};
+  for (int64_t i = 0; i < (int64_t)inputs.size(); ++i) {
+    const auto& request_options = options[std::min(max_option_idx, i)];
+    const auto& request_output = (max_output_idx == -1)
+                                     ? empty_outputs
+                                     : outputs[std::min(max_output_idx, i)];
+    results->emplace_back();
+    err = Infer(
+        &results->back(), request_options, inputs[i], request_output, headers,
+        compression_algorithm);
+    if (!err.IsOk()) {
+      return err;
+    }
+  }
+  return Error::Success;
+}
+
+Error
+InferenceServerGrpcClient::AsyncInferMulti(
+    OnMultiCompleteFn callback, const std::vector<InferOptions>& options,
+    const std::vector<std::vector<InferInput*>>& inputs,
+    const std::vector<std::vector<const InferRequestedOutput*>>& outputs,
+    const Headers& headers, grpc_compression_algorithm compression_algorithm)
+{
+  // Sanity check
+  if ((inputs.size() != options.size()) && (options.size() != 1)) {
+    return Error(
+        "'options' must either contain 1 element or match size of 'inputs'");
+  }
+  if ((inputs.size() != outputs.size()) &&
+      ((outputs.size() != 1) && (outputs.size() != 0))) {
+    return Error(
+        "'outputs' must either contain 0/1 element or match size of 'inputs'");
+  }
+  if (callback == nullptr) {
+    return Error(
+        "Callback function must be provided along with AsyncInferMulti() "
+        "call.");
+  }
+  if (!worker_.joinable()) {
+    worker_ = std::thread(&InferenceServerGrpcClient::AsyncTransfer, this);
+  }
+
+  int64_t max_option_idx = options.size() - 1;
+  // value of '-1' means no output is specified
+  int64_t max_output_idx = outputs.size() - 1;
+  static std::vector<const InferRequestedOutput*> empty_outputs{};
+  std::shared_ptr<std::atomic<size_t>> response_counter(
+      new std::atomic<size_t>(inputs.size()));
+  std::shared_ptr<std::vector<InferResult*>> responses(
+      new std::vector<InferResult*>(inputs.size()));
+  for (int64_t i = 0; i < (int64_t)inputs.size(); ++i) {
+    const auto& request_options = options[std::min(max_option_idx, i)];
+    const auto& request_output = (max_output_idx == -1)
+                                     ? empty_outputs
+                                     : outputs[std::min(max_output_idx, i)];
+
+    OnCompleteFn cb = [response_counter, responses, i,
+                       callback](InferResult* result) {
+      (*responses)[i] = result;
+      // last response
+      if (response_counter->fetch_sub(1) == 1) {
+        std::vector<InferResult*> results;
+        results.swap(*responses);
+        callback(results);
+      }
+    };
+
+    auto err = AsyncInfer(
+        cb, request_options, inputs[i], request_output, headers,
+        compression_algorithm);
+    if (!err.IsOk()) {
+      // Create response with error as other requests may be sent and their
+      // responses may not be accessed outside the callback.
+      InferResult* err_res;
+      std::shared_ptr<inference::ModelInferResponse> empty_response(
+          new inference::ModelInferResponse());
+      InferResultGrpc::Create(&err_res, empty_response, err);
+      cb(err_res);
+      continue;
+    }
   }
 
   return Error::Success;
@@ -1338,15 +1573,14 @@ InferenceServerGrpcClient::AsyncStreamTransfer()
   grpc_stream_->Finish();
 }
 
-
 InferenceServerGrpcClient::InferenceServerGrpcClient(
     const std::string& url, bool verbose, bool use_ssl,
-    const SslOptions& ssl_options, const KeepAliveOptions& keepalive_options)
+    const SslOptions& ssl_options, const grpc::ChannelArguments& channel_args,
+    const bool use_cached_channel)
     : InferenceServerClient(verbose)
 {
-  auto channel_stub =
-      GetChannelStub(url, use_ssl, ssl_options, keepalive_options);
-  stub_ = channel_stub.second;
+  stub_ = GetStub(
+      url, use_ssl, ssl_options, channel_args, use_cached_channel, verbose);
 }
 
 InferenceServerGrpcClient::~InferenceServerGrpcClient()

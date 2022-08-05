@@ -1,4 +1,4 @@
-// Copyright (c) 2020, NVIDIA CORPORATION. All rights reserved.
+// Copyright 2020-2022, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 //
 // Redistribution and use in source and binary forms, with or without
 // modification, are permitted provided that the following conditions
@@ -33,6 +33,7 @@
 #include <string>
 #include <curl/curl.h>
 #include <zlib.h>
+#include <atomic>
 #include <cstdint>
 #include <deque>
 #include <iostream>
@@ -65,12 +66,19 @@ constexpr char kContentLengthHTTPHeader[] = "Content-Length";
 // perform this initialization.
 class CurlGlobal {
  public:
-  CurlGlobal();
   ~CurlGlobal();
 
   const Error& Status() const { return err_; }
 
+  static const CurlGlobal& Get()
+  {
+    static CurlGlobal* curl_global = new CurlGlobal();
+    return *curl_global;
+  }
+
  private:
+  CurlGlobal();
+
   Error err_;
 };
 
@@ -86,7 +94,12 @@ CurlGlobal::~CurlGlobal()
   curl_global_cleanup();
 }
 
-static CurlGlobal curl_global;
+class CurlGlobalDestroyer {
+ public:
+  ~CurlGlobalDestroyer() { delete &CurlGlobal::Get(); }
+};
+
+static CurlGlobalDestroyer curl_global_destroyer_;
 
 std::string
 GetQueryString(const Headers& query_params)
@@ -109,7 +122,8 @@ GetQueryString(const Headers& query_params)
 // encoded size to get the right contents.
 void
 Base64Encode(
-    char* raw_ptr, size_t raw_size, char** encoded_ptr, int* encoded_size)
+    const char* raw_ptr, const size_t raw_size, char** encoded_ptr,
+    int* encoded_size)
 {
   // Encode the handle object to base64
   base64_encodestate es;
@@ -196,6 +210,73 @@ CompressData(
     compressed_data->emplace_back(
         std::move(current_reserved_space), source_byte_size - stream.avail_out);
   }
+  return Error::Success;
+}
+
+Error
+ParseSslCertType(
+    HttpSslOptions::CERTTYPE cert_type, std::string* curl_cert_type)
+{
+  switch (cert_type) {
+    case HttpSslOptions::CERTTYPE::CERT_PEM:
+      *curl_cert_type = "PEM";
+      break;
+    case HttpSslOptions::CERTTYPE::CERT_DER:
+      *curl_cert_type = "DER";
+      break;
+    default:
+      return Error(
+          "unsupported ssl certificate type encountered. Only PEM and DER are "
+          "supported.");
+  }
+  return Error::Success;
+}
+
+Error
+ParseSslKeyType(HttpSslOptions::KEYTYPE key_type, std::string* curl_key_type)
+{
+  switch (key_type) {
+    case HttpSslOptions::KEYTYPE::KEY_PEM:
+      *curl_key_type = "PEM";
+      break;
+    case HttpSslOptions::KEYTYPE::KEY_DER:
+      *curl_key_type = "DER";
+      break;
+    default:
+      return Error(
+          "unsupported ssl key type encountered. Only PEM and DER are "
+          "supported.");
+  }
+  return Error::Success;
+}
+
+Error
+SetSSLCurlOptions(CURL** curl, const HttpSslOptions& ssl_options)
+{
+  curl_easy_setopt(*curl, CURLOPT_SSL_VERIFYPEER, ssl_options.verify_peer);
+  curl_easy_setopt(*curl, CURLOPT_SSL_VERIFYHOST, ssl_options.verify_host);
+  if (!ssl_options.ca_info.empty()) {
+    curl_easy_setopt(*curl, CURLOPT_CAINFO, ssl_options.ca_info.c_str());
+  }
+  std::string curl_cert_type;
+  Error err = ParseSslCertType(ssl_options.cert_type, &curl_cert_type);
+  if (!err.IsOk()) {
+    return err;
+  }
+  curl_easy_setopt(*curl, CURLOPT_SSLCERTTYPE, curl_cert_type.c_str());
+  if (!ssl_options.cert.empty()) {
+    curl_easy_setopt(*curl, CURLOPT_SSLCERT, ssl_options.cert.c_str());
+  }
+  std::string curl_key_type;
+  err = ParseSslKeyType(ssl_options.key_type, &curl_key_type);
+  if (!err.IsOk()) {
+    return err;
+  }
+  curl_easy_setopt(*curl, CURLOPT_SSLKEYTYPE, curl_key_type.c_str());
+  if (!ssl_options.key.empty()) {
+    curl_easy_setopt(*curl, CURLOPT_SSLKEY, ssl_options.key.c_str());
+  }
+
   return Error::Success;
 }
 
@@ -317,18 +398,17 @@ HttpInferRequest::PrepareRequestJson(
     triton::common::TritonJson::Value parameters_json(
         *request_json, triton::common::TritonJson::ValueType::OBJECT);
     {
-      if ((options.sequence_id_ != 0) || (options.sequence_id_str_ != ""))
-        {
-          if (options.sequence_id_ != 0) {
-            parameters_json.AddUInt("sequence_id", options.sequence_id_);
-          } else {
-            parameters_json.AddString(
-                "sequence_id", options.sequence_id_str_.c_str(),
-                options.sequence_id_str_.size());
-          }
-          parameters_json.AddBool("sequence_start", options.sequence_start_);
-          parameters_json.AddBool("sequence_end", options.sequence_end_);
+      if ((options.sequence_id_ != 0) || (options.sequence_id_str_ != "")) {
+        if (options.sequence_id_ != 0) {
+          parameters_json.AddUInt("sequence_id", options.sequence_id_);
+        } else {
+          parameters_json.AddString(
+              "sequence_id", options.sequence_id_str_.c_str(),
+              options.sequence_id_str_.size());
         }
+        parameters_json.AddBool("sequence_start", options.sequence_start_);
+        parameters_json.AddBool("sequence_end", options.sequence_end_);
+      }
       if (options.priority_ != 0) {
         parameters_json.AddUInt("priority", options.priority_);
       }
@@ -512,6 +592,8 @@ class InferResultHttp : public InferResult {
       InferResult** infer_result,
       std::shared_ptr<HttpInferRequest> infer_request);
 
+  static Error Create(InferResult** infer_result, const Error err);
+
   Error RequestStatus() const override;
   Error ModelName(std::string* name) const override;
   Error ModelVersion(std::string* version) const override;
@@ -530,6 +612,7 @@ class InferResultHttp : public InferResult {
 
  private:
   InferResultHttp(std::shared_ptr<HttpInferRequest> infer_request);
+  InferResultHttp(const Error err) : status_(err) {}
 
   std::map<std::string, triton::common::TritonJson::Value>
       output_name_to_result_map_;
@@ -547,6 +630,18 @@ InferResultHttp::Create(
 {
   *infer_result =
       reinterpret_cast<InferResult*>(new InferResultHttp(infer_request));
+}
+
+Error
+InferResultHttp::Create(InferResult** infer_result, const Error err)
+{
+  if (err.IsOk()) {
+    return Error(
+        "Error is not provided for error reporting override of "
+        "InferResultHttp::Create()");
+  }
+  *infer_result = reinterpret_cast<InferResult*>(new InferResultHttp(err));
+  return Error::Success;
 }
 
 Error
@@ -920,15 +1015,17 @@ InferenceServerHttpClient::ParseResponseBody(
 Error
 InferenceServerHttpClient::Create(
     std::unique_ptr<InferenceServerHttpClient>* client,
-    const std::string& server_url, bool verbose)
+    const std::string& server_url, bool verbose,
+    const HttpSslOptions& ssl_options)
 {
-  client->reset(new InferenceServerHttpClient(server_url, verbose));
+  client->reset(
+      new InferenceServerHttpClient(server_url, verbose, ssl_options));
   return Error::Success;
 }
 
 InferenceServerHttpClient::InferenceServerHttpClient(
-    const std::string& url, bool verbose)
-    : InferenceServerClient(verbose), url_(url),
+    const std::string& url, bool verbose, const HttpSslOptions& ssl_options)
+    : InferenceServerClient(verbose), url_(url), ssl_options_(ssl_options),
       easy_handle_(reinterpret_cast<void*>(curl_easy_init())),
       multi_handle_(curl_multi_init())
 {
@@ -1072,14 +1169,47 @@ InferenceServerHttpClient::ModelRepositoryIndex(
 Error
 InferenceServerHttpClient::LoadModel(
     const std::string& model_name, const Headers& headers,
-    const Parameters& query_params)
+    const Parameters& query_params, const std::string& config,
+    const std::map<std::string, std::vector<char>>& files)
 {
   std::string request_uri(
       url_ + "/v2/repository/models/" + model_name + "/load");
 
-  std::string request;  // empty request body
+  triton::common::TritonJson::Value request_json(
+      triton::common::TritonJson::ValueType::OBJECT);
+  bool has_param = false;
+  triton::common::TritonJson::Value parameters_json(
+      request_json, triton::common::TritonJson::ValueType::OBJECT);
+  if (!config.empty()) {
+    has_param = true;
+    parameters_json.AddStringRef("config", config.c_str());
+  }
+  for (const auto& file : files) {
+    // base64 encode the file content for HTTP protocol requirement
+    // Must free encoded_handle after use to prevent memory leak
+    char* encoded_handle = nullptr;
+    int encoded_size;
+    Base64Encode(
+        file.second.data(), file.second.size(), &encoded_handle, &encoded_size);
+    if (encoded_handle == nullptr) {
+      return Error("Failed to base64 encode the file content");
+    }
+
+    has_param = true;
+    parameters_json.AddString(file.first.c_str(), encoded_handle, encoded_size);
+    free(encoded_handle);
+  }
+  if (has_param) {
+    request_json.Add("parameters", std::move(parameters_json));
+  }
+  triton::common::TritonJson::WriteBuffer buffer;
+  Error err = request_json.Write(&buffer);
+  if (!err.IsOk()) {
+    return err;
+  }
+
   std::string response;
-  return Post(request_uri, request, headers, query_params, &response);
+  return Post(request_uri, buffer.Contents(), headers, query_params, &response);
 }
 
 Error
@@ -1112,6 +1242,63 @@ InferenceServerHttpClient::ModelInferenceStatistics(
   request_uri += "/stats";
 
   return Get(request_uri, headers, query_params, infer_stat);
+}
+
+Error
+InferenceServerHttpClient::UpdateTraceSettings(
+    std::string* response, const std::string& model_name,
+    const std::map<std::string, std::vector<std::string>>& settings,
+    const Headers& headers, const Parameters& query_params)
+{
+  std::string request_uri(url_ + "/v2");
+  if (!model_name.empty()) {
+    request_uri += "/models/" + model_name;
+  }
+  request_uri += "/trace/setting";
+
+  triton::common::TritonJson::Value request_json(
+      triton::common::TritonJson::ValueType::OBJECT);
+  {
+    for (const auto& pr : settings) {
+      if (pr.second.empty()) {
+        request_json.Add(
+            pr.first.c_str(), std::move(triton::common::TritonJson::Value()));
+      } else {
+        if (pr.first == "trace_level") {
+          triton::common::TritonJson::Value level_json(
+              triton::common::TritonJson::ValueType::ARRAY);
+          for (const auto& v : pr.second) {
+            level_json.AppendStringRef(v.c_str());
+          }
+          request_json.Add(pr.first.c_str(), std::move(level_json));
+        } else {
+          request_json.AddStringRef(pr.first.c_str(), pr.second[0].c_str());
+        }
+      }
+    }
+  }
+
+  triton::common::TritonJson::WriteBuffer buffer;
+  Error err = request_json.Write(&buffer);
+  if (!err.IsOk()) {
+    return err;
+  }
+
+  return Post(request_uri, buffer.Contents(), headers, query_params, response);
+}
+
+Error
+InferenceServerHttpClient::GetTraceSettings(
+    std::string* settings, const std::string& model_name,
+    const Headers& headers, const Parameters& query_params)
+{
+  std::string request_uri(url_ + "/v2");
+  if (!model_name.empty()) {
+    request_uri += "/models/" + model_name;
+  }
+  request_uri += "/trace/setting";
+
+  return Get(request_uri, headers, query_params, settings);
 }
 
 Error
@@ -1266,8 +1453,8 @@ InferenceServerHttpClient::Infer(
   sync_request->Timer().Reset();
   sync_request->Timer().CaptureTimestamp(RequestTimers::Kind::REQUEST_START);
 
-  if (!curl_global.Status().IsOk()) {
-    return curl_global.Status();
+  if (!CurlGlobal::Get().Status().IsOk()) {
+    return CurlGlobal::Get().Status();
   }
 
   err = PreRunProcessing(
@@ -1380,6 +1567,118 @@ InferenceServerHttpClient::AsyncInfer(
   }
 
   cv_.notify_all();
+  return Error::Success;
+}
+
+Error
+InferenceServerHttpClient::InferMulti(
+    std::vector<InferResult*>* results,
+    const std::vector<InferOptions>& options,
+    const std::vector<std::vector<InferInput*>>& inputs,
+    const std::vector<std::vector<const InferRequestedOutput*>>& outputs,
+    const Headers& headers, const Parameters& query_params,
+    const CompressionType request_compression_algorithm,
+    const CompressionType response_compression_algorithm)
+{
+  Error err;
+
+  // Sanity check
+  if ((inputs.size() != options.size()) && (options.size() != 1)) {
+    return Error(
+        "'options' must either contain 1 element or match size of 'inputs'");
+  }
+  if ((inputs.size() != outputs.size()) &&
+      ((outputs.size() != 1) && (outputs.size() != 0))) {
+    return Error(
+        "'outputs' must either contain 0/1 element or match size of 'inputs'");
+  }
+
+  int64_t max_option_idx = options.size() - 1;
+  // value of '-1' means no output is specified
+  int64_t max_output_idx = outputs.size() - 1;
+  static std::vector<const InferRequestedOutput*> empty_outputs{};
+  for (int64_t i = 0; i < (int64_t)inputs.size(); ++i) {
+    const auto& request_options = options[std::min(max_option_idx, i)];
+    const auto& request_output = (max_output_idx == -1)
+                                     ? empty_outputs
+                                     : outputs[std::min(max_output_idx, i)];
+
+    results->emplace_back();
+    err = Infer(
+        &results->back(), request_options, inputs[i], request_output, headers,
+        query_params, request_compression_algorithm,
+        response_compression_algorithm);
+    if (!err.IsOk()) {
+      return err;
+    }
+  }
+  return Error::Success;
+}
+
+Error
+InferenceServerHttpClient::AsyncInferMulti(
+    OnMultiCompleteFn callback, const std::vector<InferOptions>& options,
+    const std::vector<std::vector<InferInput*>>& inputs,
+    const std::vector<std::vector<const InferRequestedOutput*>>& outputs,
+    const Headers& headers, const Parameters& query_params,
+    const CompressionType request_compression_algorithm,
+    const CompressionType response_compression_algorithm)
+{
+  // Sanity check
+  if ((inputs.size() != options.size()) && (options.size() != 1)) {
+    return Error(
+        "'options' must either contain 1 element or match size of 'inputs'");
+  }
+  if ((inputs.size() != outputs.size()) &&
+      ((outputs.size() != 1) && (outputs.size() != 0))) {
+    return Error(
+        "'outputs' must either contain 0/1 element or match size of 'inputs'");
+  }
+  if (callback == nullptr) {
+    return Error(
+        "Callback function must be provided along with AsyncInfer() call.");
+  }
+
+  int64_t max_option_idx = options.size() - 1;
+  // value of '-1' means no output is specified
+  int64_t max_output_idx = outputs.size() - 1;
+  static std::vector<const InferRequestedOutput*> empty_outputs{};
+  std::shared_ptr<std::atomic<size_t>> response_counter(
+      new std::atomic<size_t>(inputs.size()));
+  std::shared_ptr<std::vector<InferResult*>> responses(
+      new std::vector<InferResult*>(inputs.size()));
+  for (int64_t i = 0; i < (int64_t)inputs.size(); ++i) {
+    const auto& request_options = options[std::min(max_option_idx, i)];
+    const auto& request_output = (max_output_idx == -1)
+                                     ? empty_outputs
+                                     : outputs[std::min(max_output_idx, i)];
+
+    OnCompleteFn cb = [response_counter, responses, i,
+                       callback](InferResult* result) {
+      (*responses)[i] = result;
+      // last response
+      if (response_counter->fetch_sub(1) == 1) {
+        std::vector<InferResult*> results;
+        results.swap(*responses);
+        callback(results);
+      }
+    };
+    auto err = AsyncInfer(
+        cb, request_options, inputs[i], request_output, headers, query_params,
+        request_compression_algorithm, response_compression_algorithm);
+    if (!err.IsOk()) {
+      // Create response with error as other requests may be sent and their
+      // responses may not be accessed outside the callback.
+      InferResult* err_res;
+      err = InferResultHttp::Create(&err_res, err);
+      if (!err.IsOk()) {
+        std::cerr << "Failed to create result for error: " << err.Message()
+                  << std::endl;
+      }
+      cb(err_res);
+      continue;
+    }
+  }
   return Error::Success;
 }
 
@@ -1538,6 +1837,11 @@ InferenceServerHttpClient::PreRunProcessing(
 
   const curl_off_t post_byte_size = http_request->total_input_byte_size_;
   curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE_LARGE, post_byte_size);
+
+  err = SetSSLCurlOptions(&curl, ssl_options_);
+  if (!err.IsOk()) {
+    return err;
+  }
 
   struct curl_slist* list = nullptr;
 
@@ -1698,8 +2002,8 @@ InferenceServerHttpClient::Get(
     request_uri = request_uri + "?" + GetQueryString(query_params);
   }
 
-  if (!curl_global.Status().IsOk()) {
-    return curl_global.Status();
+  if (!CurlGlobal::Get().Status().IsOk()) {
+    return CurlGlobal::Get().Status();
   }
 
   CURL* curl = curl_easy_init();
@@ -1719,6 +2023,11 @@ InferenceServerHttpClient::Get(
   response->reserve(1024);
   curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, ResponseHandler);
   curl_easy_setopt(curl, CURLOPT_WRITEDATA, response);
+
+  Error err = SetSSLCurlOptions(&curl, ssl_options_);
+  if (!err.IsOk()) {
+    return err;
+  }
 
   // Add user provided headers...
   struct curl_slist* header_list = nullptr;
@@ -1769,8 +2078,8 @@ InferenceServerHttpClient::Post(
     request_uri = request_uri + "?" + GetQueryString(query_params);
   }
 
-  if (!curl_global.Status().IsOk()) {
-    return curl_global.Status();
+  if (!CurlGlobal::Get().Status().IsOk()) {
+    return CurlGlobal::Get().Status();
   }
 
   CURL* curl = curl_easy_init();
@@ -1792,6 +2101,11 @@ InferenceServerHttpClient::Post(
   response->reserve(1024);
   curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, ResponseHandler);
   curl_easy_setopt(curl, CURLOPT_WRITEDATA, response);
+
+  Error err = SetSSLCurlOptions(&curl, ssl_options_);
+  if (!err.IsOk()) {
+    return err;
+  }
 
   // Add user provided headers...
   struct curl_slist* header_list = nullptr;

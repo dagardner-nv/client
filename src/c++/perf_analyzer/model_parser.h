@@ -1,4 +1,4 @@
-// Copyright (c) 2020, NVIDIA CORPORATION. All rights reserved.
+// Copyright 2020-2022, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 //
 // Redistribution and use in source and binary forms, with or without
 // modification, are permitted provided that the following conditions
@@ -36,6 +36,7 @@ struct ModelTensor {
   std::string datatype_;
   std::vector<int64_t> shape_;
   bool is_shape_tensor_;
+  bool is_optional_;
 };
 
 using ModelTensorMap = std::map<std::string, ModelTensor>;
@@ -63,7 +64,8 @@ class ModelParser {
         inputs_(std::make_shared<ModelTensorMap>()),
         outputs_(std::make_shared<ModelTensorMap>()),
         composing_models_map_(std::make_shared<ComposingModelMap>()),
-        scheduler_type_(NONE), max_batch_size_(0), is_decoupled_(false)
+        scheduler_type_(NONE), max_batch_size_(0), is_decoupled_(false),
+        response_cache_enabled_(false)
   {
   }
 
@@ -130,6 +132,11 @@ class ModelParser {
   /// \return the truth value of whether the model is decoupled
   bool IsDecoupled() const { return is_decoupled_; }
 
+  /// Returns whether or not response cache is enabled for this model
+  /// \return the truth value of whether response cache is enabled for this
+  /// model
+  bool ResponseCacheEnabled() const { return response_cache_enabled_; }
+
   /// Get the details about the model inputs.
   /// \return The map with tensor_name and the tensor details
   /// stored as key-value pair.
@@ -165,6 +172,7 @@ class ModelParser {
   ModelSchedulerType scheduler_type_;
   size_t max_batch_size_;
   bool is_decoupled_;
+  bool response_cache_enabled_;
 };
 
 }}  // namespace triton::perfanalyzer

@@ -1,4 +1,4 @@
-// Copyright (c) 2020-2021, NVIDIA CORPORATION. All rights reserved.
+// Copyright 2020-2022, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 //
 // Redistribution and use in source and binary forms, with or without
 // modification, are permitted provided that the following conditions
@@ -26,18 +26,19 @@
 #pragma once
 
 #include <string>
+#include "../../constants.h"
 #include "../../perf_utils.h"
 #include "../client_backend.h"
 #include "grpc_client.h"
 #include "http_client.h"
 #include "shm_utils.h"
 
-#define RETURN_IF_TRITON_ERROR(S)       \
-  do {                                  \
-    const tc::Error& status__ = (S);    \
-    if (!status__.IsOk()) {             \
-      return Error(status__.Message()); \
-    }                                   \
+#define RETURN_IF_TRITON_ERROR(S)                          \
+  do {                                                     \
+    const tc::Error& status__ = (S);                       \
+    if (!status__.IsOk()) {                                \
+      return Error(status__.Message(), pa::GENERIC_ERROR); \
+    }                                                      \
   } while (false)
 
 #define FAIL_IF_TRITON_ERR(X, MSG)                                 \
@@ -45,7 +46,7 @@
     const tc::Error err = (X);                                     \
     if (!err.IsOk()) {                                             \
       std::cerr << "error: " << (MSG) << ": " << err << std::endl; \
-      exit(1);                                                     \
+      exit(pa::GENERIC_ERROR);                                     \
     }                                                              \
   }
 
@@ -64,6 +65,7 @@ class TritonClientBackend : public ClientBackend {
   /// server.
   /// \param url The inference server url and port.
   /// \param protocol The protocol type used.
+  /// \param ssl_options The SSL options used with client backend.
   /// \param http_headers Map of HTTP headers. The map key/value indicates
   /// the header name/value.
   /// \param verbose Enables the verbose mode.
@@ -72,6 +74,8 @@ class TritonClientBackend : public ClientBackend {
   /// \return Error object indicating success or failure.
   static Error Create(
       const std::string& url, const ProtocolType protocol,
+      const SslOptionsBase& ssl_options,
+      const std::map<std::string, std::vector<std::string>> trace_options,
       const grpc_compression_algorithm compression_algorithm,
       std::shared_ptr<tc::Headers> http_headers, const bool verbose,
       std::unique_ptr<ClientBackend>* client_backend);

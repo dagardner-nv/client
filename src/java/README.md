@@ -39,13 +39,7 @@ This Java API mimics Triton's official Python API. It has similar classes and me
 - `triton.client.InferenceServerClient` is the main inference class.
 
 Currently the Java API supports only a subset of the entire Triton
-protocol. Specifically:
-- Only the HTTP protocol is supported, GRPC is not supported.
-- Only synchronous inference requests are supported, asynchronous
-  and streaming inference requests are not supported.
-- Health, metadata, statistics, model-management, and [other
-  extensions](https://github.com/triton-inference-server/server/tree/main/docs/protocol)
-  are not supported.
+protocol. 
 
 A minimal example would be like:
 
@@ -90,4 +84,38 @@ public class MinExample {
 }
 ```
 
-See more examples in [examples](src/main/java/triton/client/examples/).
+## Supported and Unsupported Java client features
+
+### Supported Java client features:
+HTTP client is supported with limited capabilty. Currently supported:
+- Synchronous inference requests
+
+GRPC has very limited support. Please see [grpc generated Java client](https://github.com/triton-inference-server/client/tree/main/src/grpc_generated/java) for details 
+
+### *Unsupported* Java client features:
+GRPC client:
+- Full feature Java GRPC client and corresponding tests
+
+HTTP client:
+1. Asynchronous inference requests
+2. Streaming inference requests
+3. SSL or HTTPS protocol communications
+4. Requesting/Recieving Server Metadata Information
+5. Requesting/Recieving Model Metadata Information
+6. Requesting/Recieving Model Inference Statistics
+7. Sending inference requests using Shared Memory (System, GPU)
+8. Sending multiple synchronous inferences on server
+9. [Extensions](https://github.com/triton-inference-server/server/tree/main/docs/protocol) are not supported
+
+## Building Java Examples
+
+The Java examples can be found in [examples folder](src/main/java/triton/client/examples/). To compile these examples,
+simply run:
+
+```bash
+$ cd client/src/java 
+$ mvn clean install -Ddir=examples
+```
+
+Then you will be able to find the examples located in your target folder: `examples` and the 
+compiled jar at `target/java-api-0.0.1.jar`.

@@ -1,4 +1,4 @@
-// Copyright (c) 2020, NVIDIA CORPORATION. All rights reserved.
+// Copyright 2020-2022, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 //
 // Redistribution and use in source and binary forms, with or without
 // modification, are permitted provided that the following conditions
@@ -63,7 +63,8 @@ class LoadManager {
   virtual cb::Error ResetWorkers()
   {
     return cb::Error(
-        "resetting worker threads not supported for this load manager.");
+        "resetting worker threads not supported for this load manager.",
+        pa::GENERIC_ERROR);
   }
 
   /// Count the number of requests collected until now.
@@ -86,9 +87,12 @@ class LoadManager {
     }
     // The backend to communicate with the server
     std::unique_ptr<cb::ClientBackend> infer_backend_;
+    // The vector of pointers to InferInput objects for all possible inputs,
+    // potentially including optional inputs with no provided data.
+    std::vector<cb::InferInput*> inputs_;
     // The vector of pointers to InferInput objects to be
     // used for inference request.
-    std::vector<cb::InferInput*> inputs_;
+    std::vector<cb::InferInput*> valid_inputs_;
     // The vector of pointers to InferRequestedOutput objects
     // to be used with the inference request.
     std::vector<const cb::InferRequestedOutput*> outputs_;
@@ -110,7 +114,7 @@ class LoadManager {
     // send this request.
     uint32_t ctx_id_;
     // The timestamp of when the request was started.
-    struct timespec start_time_;
+    std::chrono::time_point<std::chrono::system_clock> start_time_;
     // Whether or not the request is at the end of a sequence.
     bool sequence_end_;
     // Whether or not the request is delayed as per schedule.
@@ -155,12 +159,18 @@ class LoadManager {
   cb::Error PrepareSharedMemoryInfer(InferContext* ctx);
 
   /// Updates the input data to use for inference request
-  /// \param inputs The vector of pointers to InferInput objects
+  /// \param inputs The vector of pointers to InferInput objects for all
+  /// possible inputs, potentially including optional inputs with no provided
+  /// data
+  /// \param valid_inputs The vector of pointers to InferInput objects to be
+  /// used for inference request.
   /// \param stream_index The data stream to use for next data
   /// \param step_index The step index to use for next data
   /// \return cb::Error object indicating success or failure.
   cb::Error UpdateInputs(
-      std::vector<cb::InferInput*>& inputs, int stream_index, int step_index);
+      const std::vector<cb::InferInput*>& inputs,
+      std::vector<cb::InferInput*>& valid_inputs, int stream_index,
+      int step_index);
 
   /// Updates the expected output data to use for inference request. Empty
   /// vector will be returned if there is no expected output associated to the
@@ -193,12 +203,17 @@ class LoadManager {
 
  private:
   /// Helper function to update the inputs
-  /// \param inputs The vector of pointers to InferInput objects
+  /// \param inputs The vector of pointers to InferInput objects for all
+  /// possible inputs, potentially including optional inputs with no provided
+  /// data
+  /// \param valid_inputs The vector of pointers to InferInput objects to be
+  /// used for inference request.
   /// \param stream_index The data stream to use for next data
   /// \param step_index The step index to use for next data
   /// \return cb::Error object indicating success or failure.
   cb::Error SetInputs(
-      const std::vector<cb::InferInput*>& inputs, const int stream_index,
+      const std::vector<cb::InferInput*>& inputs,
+      std::vector<cb::InferInput*>& valid_inputs, const int stream_index,
       const int step_index);
 
   /// Helper function to update the shared memory inputs

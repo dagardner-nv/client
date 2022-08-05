@@ -1,4 +1,4 @@
-// Copyright (c) 2020-2021, NVIDIA CORPORATION. All rights reserved.
+// Copyright 2020-2022, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 //
 // Redistribution and use in source and binary forms, with or without
 // modification, are permitted provided that the following conditions
@@ -26,24 +26,44 @@
 
 #include "client_backend.h"
 
-#include "tensorflow_serving/tfserve_client_backend.h"
-#include "torchserve/torchserve_client_backend.h"
 #include "triton/triton_client_backend.h"
+
+#ifdef TRITON_ENABLE_PERF_ANALYZER_C_API
 #include "triton_c_api/triton_c_api_backend.h"
+#endif  // TRITON_ENABLE_PERF_ANALYZER_C_API
+
+#ifdef TRITON_ENABLE_PERF_ANALYZER_TFS
+#include "tensorflow_serving/tfserve_client_backend.h"
+#endif  // TRITON_ENABLE_PERF_ANALYZER_TFS
+
+#ifdef TRITON_ENABLE_PERF_ANALYZER_TS
+#include "torchserve/torchserve_client_backend.h"
+#endif  // TRITON_ENABLE_PERF_ANALYZER_TS
 
 namespace triton { namespace perfanalyzer { namespace clientbackend {
 
 //================================================
 
-const Error Error::Success("");
+const Error Error::Success("", pa::SUCCESS);
+const Error Error::Failure("", pa::GENERIC_ERROR);
 
-Error::Error(const std::string& msg) : msg_(msg) {}
+Error::Error() : msg_(""), error_(pa::SUCCESS) {}
+
+Error::Error(const std::string& msg, const uint32_t err)
+    : msg_(msg), error_(err)
+{
+}
+
+Error::Error(const std::string& msg) : msg_(msg)
+{
+  error_ = pa::GENERIC_ERROR;
+}
 
 std::ostream&
 operator<<(std::ostream& out, const Error& err)
 {
   if (!err.msg_.empty()) {
-    out << err.msg_;
+    out << err.msg_ << std::endl;
   }
   return out;
 }
@@ -75,14 +95,13 @@ BackendKindToString(const BackendKind kind)
 grpc_compression_algorithm
 BackendToGrpcType(const GrpcCompressionAlgorithm compression_algorithm)
 {
-  if (compression_algorithm == COMPRESS_STREAM_GZIP) {
-    return grpc_compression_algorithm::GRPC_COMPRESS_STREAM_GZIP;
-  } else if (compression_algorithm == COMPRESS_DEFLATE) {
-    return grpc_compression_algorithm::GRPC_COMPRESS_DEFLATE;
-  } else if (compression_algorithm == COMPRESS_GZIP) {
-    return grpc_compression_algorithm::GRPC_COMPRESS_GZIP;
-  } else {
-    return grpc_compression_algorithm::GRPC_COMPRESS_NONE;
+  switch (compression_algorithm) {
+    case COMPRESS_DEFLATE:
+      return grpc_compression_algorithm::GRPC_COMPRESS_DEFLATE;
+    case COMPRESS_GZIP:
+      return grpc_compression_algorithm::GRPC_COMPRESS_GZIP;
+    default:
+      return grpc_compression_algorithm::GRPC_COMPRESS_NONE;
   }
 }
 
@@ -94,6 +113,8 @@ BackendToGrpcType(const GrpcCompressionAlgorithm compression_algorithm)
 Error
 ClientBackendFactory::Create(
     const BackendKind kind, const std::string& url, const ProtocolType protocol,
+    const SslOptionsBase& ssl_options,
+    const std::map<std::string, std::vector<std::string>> trace_options,
     const GrpcCompressionAlgorithm compression_algorithm,
     std::shared_ptr<Headers> http_headers,
     const std::string& triton_server_path,
@@ -101,8 +122,9 @@ ClientBackendFactory::Create(
     const bool verbose, std::shared_ptr<ClientBackendFactory>* factory)
 {
   factory->reset(new ClientBackendFactory(
-      kind, url, protocol, compression_algorithm, http_headers,
-      triton_server_path, model_repository_path, memory_type, verbose));
+      kind, url, protocol, ssl_options, trace_options, compression_algorithm,
+      http_headers, triton_server_path, model_repository_path, memory_type,
+      verbose));
   return Error::Success;
 }
 
@@ -111,9 +133,9 @@ ClientBackendFactory::CreateClientBackend(
     std::unique_ptr<ClientBackend>* client_backend)
 {
   RETURN_IF_CB_ERROR(ClientBackend::Create(
-      kind_, url_, protocol_, compression_algorithm_, http_headers_, verbose_,
-      triton_server_path, model_repository_path_, memory_type_,
-      client_backend));
+      kind_, url_, protocol_, ssl_options_, trace_options_,
+      compression_algorithm_, http_headers_, verbose_, triton_server_path,
+      model_repository_path_, memory_type_, client_backend));
   return Error::Success;
 }
 
@@ -123,6 +145,8 @@ ClientBackendFactory::CreateClientBackend(
 Error
 ClientBackend::Create(
     const BackendKind kind, const std::string& url, const ProtocolType protocol,
+    const SslOptionsBase& ssl_options,
+    const std::map<std::string, std::vector<std::string>> trace_options,
     const GrpcCompressionAlgorithm compression_algorithm,
     std::shared_ptr<Headers> http_headers, const bool verbose,
     const std::string& triton_server_path,
@@ -132,21 +156,32 @@ ClientBackend::Create(
   std::unique_ptr<ClientBackend> local_backend;
   if (kind == TRITON) {
     RETURN_IF_CB_ERROR(tritonremote::TritonClientBackend::Create(
-        url, protocol, BackendToGrpcType(compression_algorithm), http_headers,
-        verbose, &local_backend));
-  } else if (kind == TENSORFLOW_SERVING) {
+        url, protocol, ssl_options, trace_options,
+        BackendToGrpcType(compression_algorithm), http_headers, verbose,
+        &local_backend));
+  }
+#ifdef TRITON_ENABLE_PERF_ANALYZER_TFS
+  else if (kind == TENSORFLOW_SERVING) {
     RETURN_IF_CB_ERROR(tfserving::TFServeClientBackend::Create(
         url, protocol, BackendToGrpcType(compression_algorithm), http_headers,
         verbose, &local_backend));
-  } else if (kind == TORCHSERVE) {
+  }
+#endif  // TRITON_ENABLE_PERF_ANALYZER_TFS
+#ifdef TRITON_ENABLE_PERF_ANALYZER_TS
+  else if (kind == TORCHSERVE) {
     RETURN_IF_CB_ERROR(torchserve::TorchServeClientBackend::Create(
         url, protocol, http_headers, verbose, &local_backend));
-  } else if (kind == TRITON_C_API) {
+  }
+#endif  // TRITON_ENABLE_PERF_ANALYZER_TS
+#ifdef TRITON_ENABLE_PERF_ANALYZER_C_API
+  else if (kind == TRITON_C_API) {
     RETURN_IF_CB_ERROR(tritoncapi::TritonCApiClientBackend::Create(
         triton_server_path, model_repository_path, memory_type, verbose,
         &local_backend));
-  } else {
-    return Error("unsupported client backend requested");
+  }
+#endif  // TRITON_ENABLE_PERF_ANALYZER_C_API
+  else {
+    return Error("unsupported client backend requested", pa::GENERIC_ERROR);
   }
 
   *client_backend = std::move(local_backend);
@@ -159,7 +194,8 @@ ClientBackend::ServerExtensions(std::set<std::string>* server_extensions)
 {
   return Error(
       "client backend of kind " + BackendKindToString(kind_) +
-      " does not support ServerExtensions API");
+          " does not support ServerExtensions API",
+      pa::GENERIC_ERROR);
 }
 
 Error
@@ -169,7 +205,8 @@ ClientBackend::ModelMetadata(
 {
   return Error(
       "client backend of kind " + BackendKindToString(kind_) +
-      " does not support ModelMetadata API");
+          " does not support ModelMetadata API",
+      pa::GENERIC_ERROR);
 }
 
 Error
@@ -179,7 +216,8 @@ ClientBackend::ModelConfig(
 {
   return Error(
       "client backend of kind " + BackendKindToString(kind_) +
-      " does not support ModelConfig API");
+          " does not support ModelConfig API",
+      pa::GENERIC_ERROR);
 }
 
 Error
@@ -190,7 +228,8 @@ ClientBackend::Infer(
 {
   return Error(
       "client backend of kind " + BackendKindToString(kind_) +
-      " does not support Infer API");
+          " does not support Infer API",
+      pa::GENERIC_ERROR);
 }
 
 Error
@@ -201,7 +240,8 @@ ClientBackend::AsyncInfer(
 {
   return Error(
       "client backend of kind " + BackendKindToString(kind_) +
-      " does not support AsyncInfer API");
+          " does not support AsyncInfer API",
+      pa::GENERIC_ERROR);
 }
 
 Error
@@ -209,7 +249,8 @@ ClientBackend::StartStream(OnCompleteFn callback, bool enable_stats)
 {
   return Error(
       "client backend of kind " + BackendKindToString(kind_) +
-      " does not support StartStream API");
+          " does not support StartStream API",
+      pa::GENERIC_ERROR);
 }
 
 Error
@@ -219,7 +260,8 @@ ClientBackend::AsyncStreamInfer(
 {
   return Error(
       "client backend of kind " + BackendKindToString(kind_) +
-      " does not support AsyncStreamInfer API");
+          " does not support AsyncStreamInfer API",
+      pa::GENERIC_ERROR);
 }
 
 Error
@@ -227,7 +269,8 @@ ClientBackend::ClientInferStat(InferStat* infer_stat)
 {
   return Error(
       "client backend of kind " + BackendKindToString(kind_) +
-      " does not support ClientInferStat API");
+          " does not support ClientInferStat API",
+      pa::GENERIC_ERROR);
 }
 
 Error
@@ -237,7 +280,8 @@ ClientBackend::ModelInferenceStatistics(
 {
   return Error(
       "client backend of kind " + BackendKindToString(kind_) +
-      " does not support ModelInferenceStatistics API");
+          " does not support ModelInferenceStatistics API",
+      pa::GENERIC_ERROR);
 }
 
 Error
@@ -245,7 +289,8 @@ ClientBackend::UnregisterAllSharedMemory()
 {
   return Error(
       "client backend of kind " + BackendKindToString(kind_) +
-      " does not support UnregisterAllSharedMemory API");
+          " does not support UnregisterAllSharedMemory API",
+      pa::GENERIC_ERROR);
 }
 
 Error
@@ -254,7 +299,8 @@ ClientBackend::RegisterSystemSharedMemory(
 {
   return Error(
       "client backend of kind " + BackendKindToString(kind_) +
-      " does not support RegisterSystemSharedMemory API");
+          " does not support RegisterSystemSharedMemory API",
+      pa::GENERIC_ERROR);
 }
 
 Error
@@ -264,7 +310,8 @@ ClientBackend::RegisterCudaSharedMemory(
 {
   return Error(
       "client backend of kind " + BackendKindToString(kind_) +
-      " does not support RegisterCudaSharedMemory API");
+          " does not support RegisterCudaSharedMemory API",
+      pa::GENERIC_ERROR);
 }
 
 //
@@ -276,7 +323,8 @@ ClientBackend::CreateSharedMemoryRegion(
 {
   return Error(
       "client backend of kind " + BackendKindToString(kind_) +
-      " does not support CreateSharedMemoryRegion()");
+          " does not support CreateSharedMemoryRegion()",
+      pa::GENERIC_ERROR);
 }
 
 
@@ -286,7 +334,8 @@ ClientBackend::MapSharedMemory(
 {
   return Error(
       "client backend of kind " + BackendKindToString(kind_) +
-      " does not support MapSharedMemory()");
+          " does not support MapSharedMemory()",
+      pa::GENERIC_ERROR);
 }
 
 
@@ -295,7 +344,8 @@ ClientBackend::CloseSharedMemory(int shm_fd)
 {
   return Error(
       "client backend of kind " + BackendKindToString(kind_) +
-      " does not support CloseSharedMemory()");
+          " does not support CloseSharedMemory()",
+      pa::GENERIC_ERROR);
 }
 
 Error
@@ -303,7 +353,8 @@ ClientBackend::UnlinkSharedMemoryRegion(std::string shm_key)
 {
   return Error(
       "client backend of kind " + BackendKindToString(kind_) +
-      " does not support UnlinkSharedMemoryRegion()");
+          " does not support UnlinkSharedMemoryRegion()",
+      pa::GENERIC_ERROR);
 }
 
 Error
@@ -311,7 +362,8 @@ ClientBackend::UnmapSharedMemory(void* shm_addr, size_t byte_size)
 {
   return Error(
       "client backend of kind " + BackendKindToString(kind_) +
-      " does not support UnmapSharedMemory()");
+          " does not support UnmapSharedMemory()",
+      pa::GENERIC_ERROR);
 }
 
 
@@ -328,18 +380,29 @@ InferInput::Create(
   if (kind == TRITON) {
     RETURN_IF_CB_ERROR(tritonremote::TritonInferInput::Create(
         infer_input, name, dims, datatype));
-  } else if (kind == TENSORFLOW_SERVING) {
+  }
+#ifdef TRITON_ENABLE_PERF_ANALYZER_TFS
+  else if (kind == TENSORFLOW_SERVING) {
     RETURN_IF_CB_ERROR(tfserving::TFServeInferInput::Create(
         infer_input, name, dims, datatype));
-  } else if (kind == TORCHSERVE) {
+  }
+#endif  // TRITON_ENABLE_PERF_ANALYZER_TFS
+#ifdef TRITON_ENABLE_PERF_ANALYZER_TS
+  else if (kind == TORCHSERVE) {
     RETURN_IF_CB_ERROR(torchserve::TorchServeInferInput::Create(
         infer_input, name, dims, datatype));
-  } else if (kind == TRITON_C_API) {
+  }
+#endif  // TRITON_ENABLE_PERF_ANALYZER_TS
+#ifdef TRITON_ENABLE_PERF_ANALYZER_C_API
+  else if (kind == TRITON_C_API) {
     RETURN_IF_CB_ERROR(tritoncapi::TritonCApiInferInput::Create(
         infer_input, name, dims, datatype));
-  } else {
+  }
+#endif  // TRITON_ENABLE_PERF_ANALYZER_C_API
+  else {
     return Error(
-        "unsupported client backend provided to create InferInput object");
+        "unsupported client backend provided to create InferInput object",
+        pa::GENERIC_ERROR);
   }
 
   return Error::Success;
@@ -350,7 +413,8 @@ InferInput::SetShape(const std::vector<int64_t>& shape)
 {
   return Error(
       "client backend of kind " + BackendKindToString(kind_) +
-      " does not support SetShape() for InferInput");
+          " does not support SetShape() for InferInput",
+      pa::GENERIC_ERROR);
 }
 
 Error
@@ -358,7 +422,8 @@ InferInput::Reset()
 {
   return Error(
       "client backend of kind " + BackendKindToString(kind_) +
-      " does not support Reset() for InferInput");
+          " does not support Reset() for InferInput",
+      pa::GENERIC_ERROR);
 }
 
 Error
@@ -366,7 +431,8 @@ InferInput::AppendRaw(const uint8_t* input, size_t input_byte_size)
 {
   return Error(
       "client backend of kind " + BackendKindToString(kind_) +
-      " does not support AppendRaw() for InferInput");
+          " does not support AppendRaw() for InferInput",
+      pa::GENERIC_ERROR);
 }
 
 Error
@@ -375,7 +441,8 @@ InferInput::SetSharedMemory(
 {
   return Error(
       "client backend of kind " + BackendKindToString(kind_) +
-      " does not support SetSharedMemory() for InferInput");
+          " does not support SetSharedMemory() for InferInput",
+      pa::GENERIC_ERROR);
 }
 
 
@@ -397,16 +464,24 @@ InferRequestedOutput::Create(
   if (kind == TRITON) {
     RETURN_IF_CB_ERROR(tritonremote::TritonInferRequestedOutput::Create(
         infer_output, name, class_count));
-  } else if (kind == TRITON_C_API) {
-    RETURN_IF_CB_ERROR(tritoncapi::TritonCApiInferRequestedOutput::Create(
-        infer_output, name, class_count));
-  } else if (kind == TENSORFLOW_SERVING) {
+  }
+#ifdef TRITON_ENABLE_PERF_ANALYZER_TFS
+  else if (kind == TENSORFLOW_SERVING) {
     RETURN_IF_CB_ERROR(
         tfserving::TFServeInferRequestedOutput::Create(infer_output, name));
-  } else {
+  }
+#endif  // TRITON_ENABLE_PERF_ANALYZER_TFS
+#ifdef TRITON_ENABLE_PERF_ANALYZER_C_API
+  else if (kind == TRITON_C_API) {
+    RETURN_IF_CB_ERROR(tritoncapi::TritonCApiInferRequestedOutput::Create(
+        infer_output, name, class_count));
+  }
+#endif  // TRITON_ENABLE_PERF_ANALYZER_C_API
+  else {
     return Error(
         "unsupported client backend provided to create InferRequestedOutput "
-        "object");
+        "object",
+        pa::GENERIC_ERROR);
   }
 
   return Error::Success;
@@ -418,7 +493,8 @@ InferRequestedOutput::SetSharedMemory(
 {
   return Error(
       "client backend of kind " + BackendKindToString(kind_) +
-      " does not support SetSharedMemory() for InferRequestedOutput");
+          " does not support SetSharedMemory() for InferRequestedOutput",
+      pa::GENERIC_ERROR);
 }
 
 InferRequestedOutput::InferRequestedOutput(

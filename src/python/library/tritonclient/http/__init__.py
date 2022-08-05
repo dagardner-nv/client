@@ -1,4 +1,4 @@
-# Copyright (c) 2020-2021, NVIDIA CORPORATION. All rights reserved.
+# Copyright 2020-2022, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 #
 # Redistribution and use in source and binary forms, with or without
 # modification, are permitted provided that the following conditions
@@ -34,6 +34,7 @@ try:
     import numpy as np
     import struct
     import gzip, zlib
+    import base64
 except ModuleNotFoundError as error:
     raise RuntimeError(
         'The installation does not include http support. Specify \'http\' or \'all\' while installing the tritonclient package to include the support'
@@ -251,6 +252,8 @@ class InferenceServerClient:
         geventhttpclient.response.HTTPSocketPoolResponse
             The response from server.
         """
+        self._validate_headers(headers)
+
         if self._base_uri is not None:
             request_uri = self._base_uri + "/" + request_uri
 
@@ -290,6 +293,8 @@ class InferenceServerClient:
         geventhttpclient.response.HTTPSocketPoolResponse
             The response from server.
         """
+        self._validate_headers(headers)
+
         if self._base_uri is not None:
             request_uri = self._base_uri + "/" + request_uri
 
@@ -312,6 +317,35 @@ class InferenceServerClient:
             print(response)
 
         return response
+
+    def _validate_headers(self, headers):
+        """Checks for any unsupported HTTP headers before processing a request.
+
+        Parameters
+        ----------
+        headers: dict
+            HTTP headers to validate before processing the request.
+
+        Raises
+        ------
+        InferenceServerException
+            If an unsupported HTTP header is included in a request.
+        """
+        if not headers:
+            return
+
+        # HTTP headers are case-insensitive, so force lowercase for comparison
+        headers_lowercase = {k.lower(): v for k, v in headers.items()}
+        # The python client lirary (and geventhttpclient) do not encode request
+        # data based on "Transfer-Encoding" header, so reject this header if
+        # included. Other libraries may do this encoding under the hood.
+        # The python client library does expose special arguments to support
+        # some "Content-Encoding" headers.
+        if "transfer-encoding" in headers_lowercase:
+            raise_error("Unsupported HTTP header: 'Transfer-Encoding' is not "
+                        "supported in the Python client library. Use raw HTTP "
+                        "request libraries or the C++ client instead for this "
+                        "header.")
 
     def is_server_live(self, headers=None, query_params=None):
         """Contact the inference server and get liveness.
@@ -594,7 +628,12 @@ class InferenceServerClient:
 
         return json.loads(content)
 
-    def load_model(self, model_name, headers=None, query_params=None):
+    def load_model(self,
+                   model_name,
+                   headers=None,
+                   query_params=None,
+                   config=None,
+                   files=None):
         """Request the inference server to load or reload specified model.
 
         Parameters
@@ -603,10 +642,20 @@ class InferenceServerClient:
             The name of the model to be loaded.
         headers: dict
             Optional dictionary specifying additional
-            HTTP headers to include in the request
+            HTTP headers to include in the request.
         query_params: dict
             Optional url query parameters to use in network
-            transaction
+            transaction.
+        config: str
+            Optional JSON representation of a model config provided for
+            the load request, if provided, this config will be used for
+            loading the model.
+        files: dict
+            Optional dictionary specifying file path (with "file:" prefix) in
+            the override model directory to the file content as bytes.
+            The files will form the model directory that the model will be
+            loaded from. If specified, 'config' must be provided to be
+            the model configuration of the override model directory.
 
         Raises
         ------
@@ -615,8 +664,18 @@ class InferenceServerClient:
 
         """
         request_uri = "v2/repository/models/{}/load".format(quote(model_name))
+        load_request = {}
+        if config is not None:
+            if "parameters" not in load_request:
+                load_request["parameters"] = {}
+            load_request["parameters"]["config"] = config
+        if files is not None:
+            for path, content in files.items():
+                if "parameters" not in load_request:
+                    load_request["parameters"] = {}
+                load_request["parameters"][path] = base64.b64encode(content)
         response = self._post(request_uri=request_uri,
-                              request_body="",
+                              request_body=json.dumps(load_request),
                               headers=headers,
                               query_params=query_params)
         _raise_if_error(response)
@@ -710,6 +769,109 @@ class InferenceServerClient:
                 request_uri = "v2/models/{}/stats".format(quote(model_name))
         else:
             request_uri = "v2/models/stats"
+
+        response = self._get(request_uri=request_uri,
+                             headers=headers,
+                             query_params=query_params)
+        _raise_if_error(response)
+
+        content = response.read()
+        if self._verbose:
+            print(content)
+
+        return json.loads(content)
+
+    def update_trace_settings(self,
+                              model_name=None,
+                              settings={},
+                              headers=None,
+                              query_params=None):
+        """Update the trace settings for the specified model name, or
+        global trace settings if model name is not given.
+        Returns the trace settings after the update.
+
+        Parameters
+        ----------
+        model_name : str
+            The name of the model to update trace settings. Specifying None or
+            empty string will update the global trace settings.
+            The default value is None.
+        settings: dict
+            The new trace setting values. Only the settings listed will be
+            updated. If a trace setting is listed in the dictionary with
+            a value of 'None', that setting will be cleared.
+        headers: dict
+            Optional dictionary specifying additional HTTP
+            headers to include in the request.
+        query_params: dict
+            Optional url query parameters to use in network
+            transaction
+
+        Returns
+        -------
+        dict
+            The JSON dict holding the updated trace settings.
+
+        Raises
+        ------
+        InferenceServerException
+            If unable to update the trace settings.
+
+        """
+
+        if (model_name is not None) and (model_name != ""):
+            request_uri = "v2/models/{}/trace/setting".format(quote(model_name))
+        else:
+            request_uri = "v2/trace/setting"
+
+        response = self._post(request_uri=request_uri,
+                              request_body=json.dumps(settings),
+                              headers=headers,
+                              query_params=query_params)
+        _raise_if_error(response)
+
+        content = response.read()
+        if self._verbose:
+            print(content)
+
+        return json.loads(content)
+
+    def get_trace_settings(self,
+                           model_name=None,
+                           headers=None,
+                           query_params=None):
+        """Get the trace settings for the specified model name, or global trace
+        settings if model name is not given
+
+        Parameters
+        ----------
+        model_name : str
+            The name of the model to get trace settings. Specifying None or
+            empty string will return the global trace settings.
+            The default value is None.
+        headers: dict
+            Optional dictionary specifying additional HTTP
+            headers to include in the request.
+        query_params: dict
+            Optional url query parameters to use in network
+            transaction
+
+        Returns
+        -------
+        dict
+            The JSON dict holding the trace settings.
+
+        Raises
+        ------
+        InferenceServerException
+            If unable to get the trace settings.
+
+        """
+
+        if (model_name is not None) and (model_name != ""):
+            request_uri = "v2/models/{}/trace/setting".format(quote(model_name))
+        else:
+            request_uri = "v2/trace/setting"
 
         response = self._get(request_uri=request_uri,
                              headers=headers,
@@ -1013,13 +1175,13 @@ class InferenceServerClient:
 
     @staticmethod
     def generate_request_body(inputs,
-                  outputs=None,
-                  request_id="",
-                  sequence_id=0,
-                  sequence_start=False,
-                  sequence_end=False,
-                  priority=0,
-                  timeout=None):
+                              outputs=None,
+                              request_id="",
+                              sequence_id=0,
+                              sequence_start=False,
+                              sequence_end=False,
+                              priority=0,
+                              timeout=None):
         """Generate a request body for inference using the supplied 'inputs'
         requesting the outputs specified by 'outputs'.
 
@@ -1088,9 +1250,9 @@ class InferenceServerClient:
 
     @staticmethod
     def parse_response_body(response_body,
-                          verbose=False,
-                          header_length=None,
-                          content_encoding=None):
+                            verbose=False,
+                            header_length=None,
+                            content_encoding=None):
         """Generate a InferResult object from the given 'response_body'
 
         Parameters
@@ -1558,11 +1720,19 @@ class InferInput:
         """
         if not isinstance(input_tensor, (np.ndarray,)):
             raise_error("input_tensor must be a numpy array")
-        dtype = np_to_triton_dtype(input_tensor.dtype)
-        if self._datatype != dtype:
-            raise_error(
-                "got unexpected datatype {} from numpy array, expected {}".
-                format(dtype, self._datatype))
+        # DLIS-3986: Special handling for bfloat16 until Numpy officially supports it
+        if self._datatype == "BF16":
+            if input_tensor.dtype != triton_to_np_dtype(self._datatype):
+                raise_error(
+                    "got unexpected datatype {} from numpy array, expected {} for BF16 type"
+                    .format(input_tensor.dtype,
+                            triton_to_np_dtype(self._datatype)))
+        else:
+            dtype = np_to_triton_dtype(input_tensor.dtype)
+            if self._datatype != dtype:
+                raise_error(
+                    "got unexpected datatype {} from numpy array, expected {}".
+                    format(dtype, self._datatype))
         valid_shape = True
         if len(self._shape) != len(input_tensor.shape):
             valid_shape = False
@@ -1583,6 +1753,10 @@ class InferInput:
         if not binary_data:
             self._parameters.pop('binary_data_size', None)
             self._raw_data = None
+            if self._datatype == "BF16":
+                raise_error(
+                    "BF16 inputs must be sent as binary data over HTTP. Please set binary_data=True"
+                )
             if self._datatype == "BYTES":
                 self._data = []
                 try:
@@ -1616,6 +1790,12 @@ class InferInput:
                     self._raw_data = serialized_output.item()
                 else:
                     self._raw_data = b''
+            elif self._datatype == "BF16":
+                serialized_output = serialize_bf16_tensor(input_tensor)
+                if serialized_output.size > 0:
+                    self._raw_data = serialized_output.item()
+                else:
+                    self._raw_data = b''
             else:
                 self._raw_data = input_tensor.tobytes()
             self._parameters['binary_data_size'] = len(self._raw_data)
@@ -1641,7 +1821,7 @@ class InferInput:
         self._parameters['shared_memory_region'] = region_name
         self._parameters['shared_memory_byte_size'] = byte_size
         if offset != 0:
-            self._parameters['shared_memory_offset'].int64_param = offset
+            self._parameters['shared_memory_offset'] = offset
 
     def _get_binary_data(self):
         """Returns the raw binary data if available
@@ -1923,6 +2103,9 @@ class InferResult:
                                     # need to decode the raw bytes to convert into
                                     # array elements.
                                     np_array = deserialize_bytes_tensor(
+                                        self._buffer[start_index:end_index])
+                                elif datatype == "BF16":
+                                    np_array = deserialize_bf16_tensor(
                                         self._buffer[start_index:end_index])
                                 else:
                                     np_array = np.frombuffer(

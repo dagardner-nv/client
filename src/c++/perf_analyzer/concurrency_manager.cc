@@ -1,4 +1,4 @@
-// Copyright (c) 2020, NVIDIA CORPORATION. All rights reserved.
+// Copyright 2020-2022, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 //
 // Redistribution and use in source and binary forms, with or without
 // modification, are permitted provided that the following conditions
@@ -193,8 +193,8 @@ ConcurrencyManager::Infer(
       std::lock_guard<std::mutex> lock(thread_stat->mu_);
       thread_stat->cb_status_ = result_ptr->RequestStatus();
       if (thread_stat->cb_status_.IsOk()) {
-        struct timespec end_time_async;
-        clock_gettime(CLOCK_MONOTONIC, &end_time_async);
+        std::chrono::time_point<std::chrono::system_clock> end_time_async;
+        end_time_async = std::chrono::system_clock::now();
         std::string request_id;
         thread_stat->cb_status_ = result_ptr->Id(&request_id);
         const auto& it = async_req_map.find(request_id);
@@ -251,8 +251,8 @@ ConcurrencyManager::Infer(
                         sequence_stat_[seq_id]->remaining_queries_;
 
           RETURN_IF_ERROR(UpdateInputs(
-              ctxs[ctx_id]->inputs_, sequence_stat_[seq_id]->data_stream_id_,
-              step_id));
+              ctxs[ctx_id]->inputs_, ctxs[ctx_id]->valid_inputs_,
+              sequence_stat_[seq_id]->data_stream_id_, step_id));
           RETURN_IF_ERROR(UpdateValidationOutputs(
               ctxs[ctx_id]->outputs_, sequence_stat_[seq_id]->data_stream_id_,
               step_id, ctxs[ctx_id]->expected_outputs_));
@@ -320,6 +320,10 @@ ConcurrencyManager::Infer(
       wake_signal_.wait(lock, [&thread_config]() {
         return early_exit || (thread_config->concurrency_ > 0);
       });
+      // Stop executing if concurrency is 0 and early exit is requested
+      if (early_exit && thread_config->concurrency_ == 0) {
+        break;
+      }
     }
 
     size_t num_reqs = thread_config->concurrency_;
@@ -371,7 +375,8 @@ ConcurrencyManager::Infer(
                       batch_size_;
         thread_config->non_sequence_data_step_id_ += active_threads_;
         // There will be only one ctx in non-sequence case
-        thread_stat->status_ = UpdateInputs(ctxs[ctx_id]->inputs_, 0, step_id);
+        thread_stat->status_ = UpdateInputs(
+            ctxs[ctx_id]->inputs_, ctxs[ctx_id]->valid_inputs_, 0, step_id);
         if (thread_stat->status_.IsOk()) {
           thread_stat->status_ = UpdateValidationOutputs(
               ctxs[ctx_id]->outputs_, 0, step_id,
@@ -407,8 +412,8 @@ ConcurrencyManager::Infer(
                           sequence_stat_[seq_id]->remaining_queries_;
 
             thread_stat->status_ = UpdateInputs(
-                ctxs[ctx_id]->inputs_, sequence_stat_[seq_id]->data_stream_id_,
-                step_id);
+                ctxs[ctx_id]->inputs_, ctxs[ctx_id]->valid_inputs_,
+                sequence_stat_[seq_id]->data_stream_id_, step_id);
             if (thread_stat->status_.IsOk()) {
               thread_stat->status_ = UpdateValidationOutputs(
                   ctxs[ctx_id]->outputs_,
@@ -431,28 +436,29 @@ ConcurrencyManager::Infer(
                             ctxs[ctx_id]->options_->request_id_,
                             AsyncRequestProperties())
                         .first;
-          clock_gettime(CLOCK_MONOTONIC, &(it->second.start_time_));
+          it->second.start_time_ = std::chrono::system_clock::now();
           it->second.ctx_id_ = ctx_id;
           it->second.sequence_end_ = ctxs[ctx_id]->options_->sequence_end_;
         }
         if (streaming_) {
           thread_stat->status_ = ctxs[ctx_id]->infer_backend_->AsyncStreamInfer(
-              *(ctxs[ctx_id]->options_), ctxs[ctx_id]->inputs_,
+              *(ctxs[ctx_id]->options_), ctxs[ctx_id]->valid_inputs_,
               ctxs[ctx_id]->outputs_);
         } else {
           thread_stat->status_ = ctxs[ctx_id]->infer_backend_->AsyncInfer(
-              callback_func, *(ctxs[ctx_id]->options_), ctxs[ctx_id]->inputs_,
-              ctxs[ctx_id]->outputs_);
+              callback_func, *(ctxs[ctx_id]->options_),
+              ctxs[ctx_id]->valid_inputs_, ctxs[ctx_id]->outputs_);
         }
         if (!thread_stat->status_.IsOk()) {
           return;
         }
       } else {
-        struct timespec start_time_sync, end_time_sync;
-        clock_gettime(CLOCK_MONOTONIC, &start_time_sync);
+        std::chrono::time_point<std::chrono::system_clock> start_time_sync,
+            end_time_sync;
+        start_time_sync = std::chrono::system_clock::now();
         cb::InferResult* results = nullptr;
         thread_stat->status_ = ctxs[ctx_id]->infer_backend_->Infer(
-            &results, *(ctxs[ctx_id]->options_), ctxs[ctx_id]->inputs_,
+            &results, *(ctxs[ctx_id]->options_), ctxs[ctx_id]->valid_inputs_,
             ctxs[ctx_id]->outputs_);
         if (results != nullptr) {
           if (thread_stat->status_.IsOk()) {
@@ -463,7 +469,7 @@ ConcurrencyManager::Infer(
         if (!thread_stat->status_.IsOk()) {
           return;
         }
-        clock_gettime(CLOCK_MONOTONIC, &end_time_sync);
+        end_time_sync = std::chrono::system_clock::now();
         {
           // Add the request timestamp to thread Timestamp vector with proper
           // locking

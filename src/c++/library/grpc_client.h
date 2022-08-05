@@ -1,4 +1,4 @@
-// Copyright 2020-2021, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// Copyright 2020-2022, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 //
 // Redistribution and use in source and binary forms, with or without
 // modification, are permitted provided that the following conditions
@@ -27,6 +27,7 @@
 
 /// \file
 
+#include <grpcpp/grpcpp.h>
 #include <queue>
 #include "common.h"
 #include "grpc_service.grpc.pb.h"
@@ -101,6 +102,8 @@ class InferenceServerGrpcClient : public InferenceServerClient {
   ~InferenceServerGrpcClient();
 
   /// Create a client that can be used to communicate with the server.
+  /// This is the expected method for most users to create a GRPC client with
+  /// the options directly exposed Triton.
   /// \param client Returns a new InferenceServerGrpcClient object.
   /// \param server_url The inference server name and port.
   /// \param verbose If true generate verbose output when contacting
@@ -110,12 +113,42 @@ class InferenceServerGrpcClient : public InferenceServerClient {
   /// SSL encryption and authorization.
   /// \param keepalive_options Specifies the GRPC KeepAlive options described
   /// in https://grpc.github.io/grpc/cpp/md_doc_keepalive.html
+  /// \param use_cached_channel If false, a new channel is created for each
+  /// new client instance. When true, re-use old channels from cache for new
+  /// client instances. The default value is true.
   /// \return Error object indicating success or failure.
   static Error Create(
       std::unique_ptr<InferenceServerGrpcClient>* client,
       const std::string& server_url, bool verbose = false, bool use_ssl = false,
       const SslOptions& ssl_options = SslOptions(),
-      const KeepAliveOptions& keepalive_options = KeepAliveOptions());
+      const KeepAliveOptions& keepalive_options = KeepAliveOptions(),
+      const bool use_cached_channel = true);
+
+  /// Create a client that can be used to communicate with the server.
+  /// This method is available for advanced users who need to specify custom
+  /// grpc::ChannelArguments not exposed by Triton, at their own risk.
+  /// \param client Returns a new InferenceServerGrpcClient object.
+  /// \param channel_args Exposes user-defined grpc::ChannelArguments to
+  /// be set for the client. Triton assumes that the "channel_args" passed
+  /// to this method are correct and complete, and are set at the user's
+  /// own risk. For example, GRPC KeepAlive options may be specified directly
+  /// in this argument rather than passing a KeepAliveOptions object.
+  /// \param server_url The inference server name and port.
+  /// \param verbose If true generate verbose output when contacting
+  /// the inference server.
+  /// \param use_ssl If true use encrypted channel to the server.
+  /// \param ssl_options Specifies the files required for
+  /// SSL encryption and authorization.
+  /// \param use_cached_channel If false, a new channel is created for each
+  /// new client instance. When true, re-use old channels from cache for new
+  /// client instances. The default value is true.
+  /// \return Error object indicating success or failure.
+  static Error Create(
+      std::unique_ptr<InferenceServerGrpcClient>* client,
+      const std::string& server_url, const grpc::ChannelArguments& channel_args,
+      bool verbose = false, bool use_ssl = false,
+      const SslOptions& ssl_options = SslOptions(),
+      const bool use_cached_channel = true);
 
   /// Contact the inference server and get its liveness.
   /// \param live Returns whether the server is live or not.
@@ -200,9 +233,19 @@ class InferenceServerGrpcClient : public InferenceServerClient {
   /// \param model_name The name of the model to be loaded or reloaded.
   /// \param headers Optional map specifying additional HTTP headers to include
   /// in the metadata of gRPC request.
+  /// \param config Optional JSON representation of a model config provided for
+  /// the load request, if provided, this config will be used for
+  /// loading the model.
+  /// \param files Optional map specifying file path (with "file:"
+  /// prefix) in the override model directory to the file content.
+  /// The files will form the model directory that the model
+  /// will be loaded from. If specified, 'config' must be provided to be
+  /// the model configuration of the override model directory.
   /// \return Error object indicating success or failure of the request.
   Error LoadModel(
-      const std::string& model_name, const Headers& headers = Headers());
+      const std::string& model_name, const Headers& headers = Headers(),
+      const std::string& config = std::string(),
+      const std::map<std::string, std::vector<char>>& files = {});
 
   /// Request the inference server to unload specified model.
   /// \param model_name The name of the model to be unloaded.
@@ -229,6 +272,41 @@ class InferenceServerGrpcClient : public InferenceServerClient {
       inference::ModelStatisticsResponse* infer_stat,
       const std::string& model_name = "", const std::string& model_version = "",
       const Headers& headers = Headers());
+
+  /// Update the trace settings for the specified model name, or global trace
+  /// settings if model name is not given.
+  /// \param response The updated settings as TraceSettingResponse.
+  /// \param model_name The name of the model to update trace settings. The
+  /// default value is an empty string which means the global trace settings
+  /// will be updated.
+  /// \param settings The new trace setting values. Only the settings listed
+  /// will be updated. If a trace setting is listed in the map with an empty
+  /// string, that setting will be cleared.
+  /// \param config Optional JSON representation of a model config provided for
+  /// the load request, if provided, this config will be used for
+  /// loading the model.
+  /// \param headers Optional map specifying additional HTTP headers to include
+  /// in the metadata of gRPC request.
+  /// \return Error object indicating success or failure of the request.
+  Error UpdateTraceSettings(
+      inference::TraceSettingResponse* response,
+      const std::string& model_name = "",
+      const std::map<std::string, std::vector<std::string>>& settings =
+          std::map<std::string, std::vector<std::string>>(),
+      const Headers& headers = Headers());
+
+  /// Get the trace settings for the specified model name, or global trace
+  /// settings if model name is not given.
+  /// \param settings The trace settings as TraceSettingResponse.
+  /// \param model_name The name of the model to get trace settings. The
+  /// default value is an empty string which means the global trace settings
+  /// will be returned.
+  /// \param headers Optional map specifying additional HTTP headers to include
+  /// in the metadata of gRPC request.
+  /// \return Error object indicating success or failure of the request.
+  Error GetTraceSettings(
+      inference::TraceSettingResponse* settings,
+      const std::string& model_name = "", const Headers& headers = Headers());
 
   /// Contact the inference server and get the status for requested system
   /// shared memory.
@@ -359,6 +437,62 @@ class InferenceServerGrpcClient : public InferenceServerClient {
       const Headers& headers = Headers(),
       grpc_compression_algorithm compression_algorithm = GRPC_COMPRESS_NONE);
 
+  /// Run multiple synchronous inferences on server.
+  /// \param results Returns the results of the inferences.
+  /// \param options The options for each inference request, one set of
+  /// options may be provided and it will be used for all inference requests.
+  /// \param inputs The vector of InferInput objects describing the model inputs
+  /// for each inference request.
+  /// \param outputs Optional vector of InferRequestedOutput objects describing
+  /// how the output must be returned. If not provided then all the outputs in
+  /// the model config will be returned as default settings. And one set of
+  /// outputs may be provided and it will be used for all inference requests.
+  /// \param headers Optional map specifying additional HTTP headers to include
+  /// in the metadata of gRPC request.
+  /// \param compression_algorithm The compression algorithm to be used
+  /// by gRPC when sending requests. By default compression is not used.
+  /// \return Error object indicating success or failure of the
+  /// request.
+  Error InferMulti(
+      std::vector<InferResult*>* results,
+      const std::vector<InferOptions>& options,
+      const std::vector<std::vector<InferInput*>>& inputs,
+      const std::vector<std::vector<const InferRequestedOutput*>>& outputs =
+          std::vector<std::vector<const InferRequestedOutput*>>(),
+      const Headers& headers = Headers(),
+      grpc_compression_algorithm compression_algorithm = GRPC_COMPRESS_NONE);
+
+  /// Run multiple asynchronous inferences on server.
+  /// Once all the requests are completed, the vector of InferResult pointers
+  /// will be passed to the provided 'callback' function. Upon the invocation
+  /// of callback function, the ownership of the InferResult objects are
+  /// transfered to the function caller. It is then the caller's choice on
+  /// either retrieving the results inside the callback function or deferring it
+  /// to a different thread so that the client is unblocked. In order to
+  /// prevent memory leak, user must ensure these objects get deleted.
+  /// \param callback The callback function to be invoked on the completion of
+  /// all requests.
+  /// \param options The options for each inference request, one set of
+  /// option may be provided and it will be used for all inference requests.
+  /// \param inputs The vector of InferInput objects describing the model inputs
+  /// for each inference request.
+  /// \param outputs Optional vector of InferRequestedOutput objects describing
+  /// how the output must be returned. If not provided then all the outputs in
+  /// the model config will be returned as default settings. And one set of
+  /// outputs may be provided and it will be used for all inference requests.
+  /// \param headers Optional map specifying additional HTTP headers to include
+  /// in the metadata of gRPC request.
+  /// \param compression_algorithm The compression algorithm to be used
+  /// by gRPC when sending requests. By default compression is not used.
+  /// \return Error object indicating success or failure of the request.
+  Error AsyncInferMulti(
+      OnMultiCompleteFn callback, const std::vector<InferOptions>& options,
+      const std::vector<std::vector<InferInput*>>& inputs,
+      const std::vector<std::vector<const InferRequestedOutput*>>& outputs =
+          std::vector<std::vector<const InferRequestedOutput*>>(),
+      const Headers& headers = Headers(),
+      grpc_compression_algorithm compression_algorithm = GRPC_COMPRESS_NONE);
+
   /// Starts a grpc bi-directional stream to send streaming inferences.
   /// \param callback The callback function to be invoked on receiving a
   /// response at the stream.
@@ -403,7 +537,9 @@ class InferenceServerGrpcClient : public InferenceServerClient {
  private:
   InferenceServerGrpcClient(
       const std::string& url, bool verbose, bool use_ssl,
-      const SslOptions& ssl_options, const KeepAliveOptions& keepalive_options);
+      const SslOptions& ssl_options, const grpc::ChannelArguments& channel_args,
+      const bool use_cached_channel);
+
   Error PreRunProcessing(
       const InferOptions& options, const std::vector<InferInput*>& inputs,
       const std::vector<const InferRequestedOutput*>& outputs);

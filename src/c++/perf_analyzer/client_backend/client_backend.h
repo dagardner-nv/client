@@ -1,4 +1,4 @@
-// Copyright (c) 2020-2021, NVIDIA CORPORATION. All rights reserved.
+// Copyright 2020-2022, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 //
 // Redistribution and use in source and binary forms, with or without
 // modification, are permitted provided that the following conditions
@@ -34,6 +34,7 @@
 #include <set>
 #include <string>
 #include <vector>
+#include "../constants.h"
 #include "ipc.h"
 
 namespace triton { namespace perfanalyzer { namespace clientbackend {
@@ -59,7 +60,7 @@ namespace triton { namespace perfanalyzer { namespace clientbackend {
     triton::perfanalyzer::clientbackend::Error err = (X);          \
     if (!err.IsOk()) {                                             \
       std::cerr << "error: " << (MSG) << ": " << err << std::endl; \
-      exit(1);                                                     \
+      exit(err.Err());                                             \
     }                                                              \
   }                                                                \
   while (false)
@@ -69,26 +70,43 @@ namespace triton { namespace perfanalyzer { namespace clientbackend {
 ///
 class Error {
  public:
+  /// Create an error
+  explicit Error();
+
+  /// Create an error with the specified message and error code.
+  /// \param msg The message for the error
+  /// \param err The error code for the error
+  explicit Error(const std::string& msg, const uint32_t err);
+
   /// Create an error with the specified message.
   /// \param msg The message for the error
-  explicit Error(const std::string& msg = "");
+  explicit Error(const std::string& msg);
 
   /// Accessor for the message of this error.
   /// \return The messsage for the error. Empty if no error.
   const std::string& Message() const { return msg_; }
 
+  /// Accessor for the error code.
+  /// \return The error code for the error. 0 if no error.
+  const uint32_t Err() const { return error_; }
+
   /// Does this error indicate OK status?
   /// \return True if this error indicates "ok"/"success", false if
   /// error indicates a failure.
-  bool IsOk() const { return msg_.empty(); }
+  bool IsOk() const { return error_ == 0; }
 
   /// Convenience "success" value. Can be used as Error::Success to
   /// indicate no error.
   static const Error Success;
 
+  /// Convenience "failure" value. Can be used as Error::Failure to
+  /// indicate a generic error.
+  static const Error Failure;
+
  private:
   friend std::ostream& operator<<(std::ostream&, const Error&);
-  std::string msg_;
+  std::string msg_{""};
+  uint32_t error_{pa::SUCCESS};
 };
 
 //===================================================================================
@@ -108,8 +126,7 @@ enum ProtocolType { HTTP = 0, GRPC = 1, UNKNOWN = 2 };
 enum GrpcCompressionAlgorithm {
   COMPRESS_NONE = 0,
   COMPRESS_DEFLATE = 1,
-  COMPRESS_GZIP = 2,
-  COMPRESS_STREAM_GZIP = 3
+  COMPRESS_GZIP = 2
 };
 typedef std::map<std::string, std::string> Headers;
 
@@ -144,11 +161,19 @@ struct ModelStatistics {
   uint64_t success_count_;
   uint64_t inference_count_;
   uint64_t execution_count_;
+  uint64_t queue_count_;
+  uint64_t compute_input_count_;
+  uint64_t compute_infer_count_;
+  uint64_t compute_output_count_;
+  uint64_t cache_hit_count_;
+  uint64_t cache_miss_count_;
   uint64_t cumm_time_ns_;
   uint64_t queue_time_ns_;
   uint64_t compute_input_time_ns_;
   uint64_t compute_infer_time_ns_;
   uint64_t compute_output_time_ns_;
+  uint64_t cache_hit_time_ns_;
+  uint64_t cache_miss_time_ns_;
 };
 
 //==============================================================================
@@ -189,6 +214,19 @@ struct InferOptions {
   bool sequence_end_;
 };
 
+struct SslOptionsBase {
+  bool ssl_grpc_use_ssl = false;
+  std::string ssl_grpc_root_certifications_file = "";
+  std::string ssl_grpc_private_key_file = "";
+  std::string ssl_grpc_certificate_chain_file = "";
+  long ssl_https_verify_peer = 1L;
+  long ssl_https_verify_host = 2L;
+  std::string ssl_https_ca_certificates_file = "";
+  std::string ssl_https_client_certificate_file = "";
+  std::string ssl_https_client_certificate_type = "";
+  std::string ssl_https_private_key_file = "";
+  std::string ssl_https_private_key_type = "";
+};
 
 //
 // The object factory to create client backends to communicate with the
@@ -200,6 +238,7 @@ class ClientBackendFactory {
   /// \param kind The kind of client backend to create.
   /// \param url The inference server url and port.
   /// \param protocol The protocol type used.
+  /// \param ssl_options The SSL options used with client backend.
   /// \param compression_algorithm The compression algorithm to be used
   /// on the grpc requests.
   /// \param http_headers Map of HTTP headers. The map key/value
@@ -217,7 +256,8 @@ class ClientBackendFactory {
   /// \return Error object indicating success or failure.
   static Error Create(
       const BackendKind kind, const std::string& url,
-      const ProtocolType protocol,
+      const ProtocolType protocol, const SslOptionsBase& ssl_options,
+      const std::map<std::string, std::vector<std::string>> trace_options,
       const GrpcCompressionAlgorithm compression_algorithm,
       std::shared_ptr<Headers> http_headers,
       const std::string& triton_server_path,
@@ -231,13 +271,15 @@ class ClientBackendFactory {
  private:
   ClientBackendFactory(
       const BackendKind kind, const std::string& url,
-      const ProtocolType protocol,
+      const ProtocolType protocol, const SslOptionsBase& ssl_options,
+      const std::map<std::string, std::vector<std::string>> trace_options,
       const GrpcCompressionAlgorithm compression_algorithm,
       const std::shared_ptr<Headers> http_headers,
       const std::string& triton_server_path,
       const std::string& model_repository_path, const std::string& memory_type,
       const bool verbose)
-      : kind_(kind), url_(url), protocol_(protocol),
+      : kind_(kind), url_(url), protocol_(protocol), ssl_options_(ssl_options),
+        trace_options_(trace_options),
         compression_algorithm_(compression_algorithm),
         http_headers_(http_headers), triton_server_path(triton_server_path),
         model_repository_path_(model_repository_path),
@@ -248,6 +290,8 @@ class ClientBackendFactory {
   const BackendKind kind_;
   const std::string url_;
   const ProtocolType protocol_;
+  const SslOptionsBase& ssl_options_;
+  const std::map<std::string, std::vector<std::string>> trace_options_;
   const GrpcCompressionAlgorithm compression_algorithm_;
   std::shared_ptr<Headers> http_headers_;
   std::string triton_server_path;
@@ -263,7 +307,8 @@ class ClientBackend {
  public:
   static Error Create(
       const BackendKind kind, const std::string& url,
-      const ProtocolType protocol,
+      const ProtocolType protocol, const SslOptionsBase& ssl_options,
+      const std::map<std::string, std::vector<std::string>> trace_options,
       const GrpcCompressionAlgorithm compression_algorithm,
       std::shared_ptr<Headers> http_headers, const bool verbose,
       const std::string& library_directory, const std::string& model_repository,

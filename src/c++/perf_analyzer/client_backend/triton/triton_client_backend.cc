@@ -1,4 +1,4 @@
-// Copyright (c) 2020-2021, NVIDIA CORPORATION. All rights reserved.
+// Copyright 2020-2022, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 //
 // Redistribution and use in source and binary forms, with or without
 // modification, are permitted provided that the following conditions
@@ -28,6 +28,55 @@
 
 #include "json_utils.h"
 
+namespace {
+
+triton::client::HttpSslOptions
+ParseHttpSslOptions(
+    const triton::perfanalyzer::clientbackend::SslOptionsBase& ssl_options)
+{
+  triton::client::HttpSslOptions http_ssl_options;
+
+  http_ssl_options.verify_peer = ssl_options.ssl_https_verify_peer;
+  http_ssl_options.verify_host = ssl_options.ssl_https_verify_host;
+  http_ssl_options.ca_info = ssl_options.ssl_https_ca_certificates_file;
+  if (ssl_options.ssl_https_client_certificate_type == "PEM") {
+    http_ssl_options.cert_type =
+        triton::client::HttpSslOptions::CERTTYPE::CERT_PEM;
+  } else if (ssl_options.ssl_https_client_certificate_type == "DER") {
+    http_ssl_options.cert_type =
+        triton::client::HttpSslOptions::CERTTYPE::CERT_DER;
+  }
+  http_ssl_options.cert = ssl_options.ssl_https_client_certificate_file;
+  if (ssl_options.ssl_https_private_key_type == "PEM") {
+    http_ssl_options.key_type =
+        triton::client::HttpSslOptions::KEYTYPE::KEY_PEM;
+  } else if (ssl_options.ssl_https_private_key_type == "DER") {
+    http_ssl_options.key_type =
+        triton::client::HttpSslOptions::KEYTYPE::KEY_DER;
+  }
+  http_ssl_options.key = ssl_options.ssl_https_private_key_file;
+
+  return http_ssl_options;
+}
+
+std::pair<bool, triton::client::SslOptions>
+ParseGrpcSslOptions(
+    const triton::perfanalyzer::clientbackend::SslOptionsBase& ssl_options)
+{
+  bool use_ssl = ssl_options.ssl_grpc_use_ssl;
+
+  triton::client::SslOptions grpc_ssl_options;
+  grpc_ssl_options.root_certificates =
+      ssl_options.ssl_grpc_root_certifications_file;
+  grpc_ssl_options.private_key = ssl_options.ssl_grpc_private_key_file;
+  grpc_ssl_options.certificate_chain =
+      ssl_options.ssl_grpc_certificate_chain_file;
+
+  return std::pair<bool, triton::client::SslOptions>{use_ssl, grpc_ssl_options};
+}
+
+}  // namespace
+
 namespace triton { namespace perfanalyzer { namespace clientbackend {
 namespace tritonremote {
 //==============================================================================
@@ -35,6 +84,8 @@ namespace tritonremote {
 Error
 TritonClientBackend::Create(
     const std::string& url, const ProtocolType protocol,
+    const SslOptionsBase& ssl_options,
+    const std::map<std::string, std::vector<std::string>> trace_options,
     const grpc_compression_algorithm compression_algorithm,
     std::shared_ptr<Headers> http_headers, const bool verbose,
     std::unique_ptr<ClientBackend>* client_backend)
@@ -42,11 +93,31 @@ TritonClientBackend::Create(
   std::unique_ptr<TritonClientBackend> triton_client_backend(
       new TritonClientBackend(protocol, compression_algorithm, http_headers));
   if (protocol == ProtocolType::HTTP) {
+    triton::client::HttpSslOptions http_ssl_options =
+        ParseHttpSslOptions(ssl_options);
     RETURN_IF_TRITON_ERROR(tc::InferenceServerHttpClient::Create(
-        &(triton_client_backend->client_.http_client_), url, verbose));
+        &(triton_client_backend->client_.http_client_), url, verbose,
+        http_ssl_options));
+    if (!trace_options.empty()) {
+      std::string response;
+      RETURN_IF_TRITON_ERROR(
+          triton_client_backend->client_.http_client_->UpdateTraceSettings(
+              &response, "", trace_options));
+    }
   } else {
+    std::pair<bool, triton::client::SslOptions> grpc_ssl_options_pair =
+        ParseGrpcSslOptions(ssl_options);
+    bool use_ssl = grpc_ssl_options_pair.first;
+    triton::client::SslOptions grpc_ssl_options = grpc_ssl_options_pair.second;
     RETURN_IF_TRITON_ERROR(tc::InferenceServerGrpcClient::Create(
-        &(triton_client_backend->client_.grpc_client_), url, verbose));
+        &(triton_client_backend->client_.grpc_client_), url, verbose, use_ssl,
+        grpc_ssl_options));
+    if (!trace_options.empty()) {
+      inference::TraceSettingResponse response;
+      RETURN_IF_TRITON_ERROR(
+          triton_client_backend->client_.grpc_client_->UpdateTraceSettings(
+              &response, "", trace_options));
+    }
   }
 
   *client_backend = std::move(triton_client_backend);
@@ -221,7 +292,7 @@ TritonClientBackend::StartStream(OnCompleteFn callback, bool enable_stats)
         wrapped_callback, enable_stats, 0 /* stream_timeout */, *http_headers_,
         compression_algorithm_));
   } else {
-    return Error("HTTP does not support starting streams");
+    return Error("HTTP does not support starting streams", pa::GENERIC_ERROR);
   }
 
   return Error::Success;
@@ -245,7 +316,8 @@ TritonClientBackend::AsyncStreamInfer(
     RETURN_IF_TRITON_ERROR(client_.grpc_client_->AsyncStreamInfer(
         triton_options, triton_inputs, triton_outputs));
   } else {
-    return Error("HTTP does not support streaming inferences");
+    return Error(
+        "HTTP does not support streaming inferences", pa::GENERIC_ERROR);
   }
 
   return Error::Success;
@@ -444,6 +516,13 @@ TritonClientBackend::ParseStatistics(
     it->second.inference_count_ = this_stat.inference_count();
     it->second.execution_count_ = this_stat.execution_count();
     it->second.success_count_ = this_stat.inference_stats().success().count();
+    it->second.queue_count_ = this_stat.inference_stats().queue().count();
+    it->second.compute_input_count_ =
+        this_stat.inference_stats().compute_input().count();
+    it->second.compute_infer_count_ =
+        this_stat.inference_stats().compute_infer().count();
+    it->second.compute_output_count_ =
+        this_stat.inference_stats().compute_output().count();
     it->second.cumm_time_ns_ = this_stat.inference_stats().success().ns();
     it->second.queue_time_ns_ = this_stat.inference_stats().queue().ns();
     it->second.compute_input_time_ns_ =
@@ -452,6 +531,14 @@ TritonClientBackend::ParseStatistics(
         this_stat.inference_stats().compute_infer().ns();
     it->second.compute_output_time_ns_ =
         this_stat.inference_stats().compute_output().ns();
+    it->second.cache_hit_count_ =
+        this_stat.inference_stats().cache_hit().count();
+    it->second.cache_hit_time_ns_ =
+        this_stat.inference_stats().cache_hit().ns();
+    it->second.cache_miss_count_ =
+        this_stat.inference_stats().cache_miss().count();
+    it->second.cache_miss_time_ns_ =
+        this_stat.inference_stats().cache_miss().ns();
   }
 }
 
@@ -473,6 +560,14 @@ TritonClientBackend::ParseStatistics(
     it->second.execution_count_ = this_stat["execution_count"].GetUint64();
     it->second.success_count_ =
         this_stat["inference_stats"]["success"]["count"].GetUint64();
+    it->second.queue_count_ =
+        this_stat["inference_stats"]["queue"]["count"].GetUint64();
+    it->second.compute_input_count_ =
+        this_stat["inference_stats"]["compute_input"]["count"].GetUint64();
+    it->second.compute_infer_count_ =
+        this_stat["inference_stats"]["compute_infer"]["count"].GetUint64();
+    it->second.compute_output_count_ =
+        this_stat["inference_stats"]["compute_output"]["count"].GetUint64();
     it->second.cumm_time_ns_ =
         this_stat["inference_stats"]["success"]["ns"].GetUint64();
     it->second.queue_time_ns_ =
@@ -483,6 +578,14 @@ TritonClientBackend::ParseStatistics(
         this_stat["inference_stats"]["compute_infer"]["ns"].GetUint64();
     it->second.compute_output_time_ns_ =
         this_stat["inference_stats"]["compute_output"]["ns"].GetUint64();
+    it->second.cache_hit_count_ =
+        this_stat["inference_stats"]["cache_hit"]["count"].GetUint64();
+    it->second.cache_hit_time_ns_ =
+        this_stat["inference_stats"]["cache_hit"]["ns"].GetUint64();
+    it->second.cache_miss_count_ =
+        this_stat["inference_stats"]["cache_miss"]["count"].GetUint64();
+    it->second.cache_miss_time_ns_ =
+        this_stat["inference_stats"]["cache_miss"]["ns"].GetUint64();
   }
 }
 

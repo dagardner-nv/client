@@ -1,4 +1,4 @@
-// Copyright (c) 2020-2021, NVIDIA CORPORATION. All rights reserved.
+// Copyright 2020-2022, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 //
 // Redistribution and use in source and binary forms, with or without
 // modification, are permitted provided that the following conditions
@@ -41,6 +41,50 @@ class HttpInferRequest;
 typedef std::map<std::string, std::string> Headers;
 /// The key-value map type to be included as URL parameters.
 typedef std::map<std::string, std::string> Parameters;
+
+// The options for authorizing and authenticating SSL/TLS connections.
+struct HttpSslOptions {
+  enum CERTTYPE { CERT_PEM = 0, CERT_DER = 1 };
+  enum KEYTYPE {
+    KEY_PEM = 0,
+    KEY_DER = 1
+    // TODO: Support loading private key from crypto engine
+    // KEY_ENG = 2
+  };
+  explicit HttpSslOptions()
+      : verify_peer(1), verify_host(2), cert_type(CERTTYPE::CERT_PEM),
+        key_type(KEYTYPE::KEY_PEM)
+  {
+  }
+  // This option determines whether curl verifies the authenticity of the peer's
+  // certificate. A value of 1 means curl verifies; 0 (zero) means it does not.
+  // Default value is 1. See here for more details:
+  // https://curl.se/libcurl/c/CURLOPT_SSL_VERIFYPEER.html
+  long verify_peer;
+  // This option determines whether libcurl verifies that the server cert is for
+  // the server it is known as. The default value for this option is 2 which
+  // means that certificate must indicate that the server is the server to which
+  // you meant to connect, or the connection fails. See here for more details:
+  // https://curl.se/libcurl/c/CURLOPT_SSL_VERIFYHOST.html
+  long verify_host;
+  // File holding one or more certificates to verify the peer with. If not
+  // specified, client will look for the system path where cacert bundle is
+  // assumed to be stored, as established at build time. See here for more
+  // information: https://curl.se/libcurl/c/CURLOPT_CAINFO.html
+  std::string ca_info;
+  // The format of client certificate. By default it is CERT_PEM. See here for
+  // more details: https://curl.se/libcurl/c/CURLOPT_SSLCERTTYPE.html
+  CERTTYPE cert_type;
+  // The file name of your client certificate. See here for more details:
+  // https://curl.se/libcurl/c/CURLOPT_SSLCERT.html
+  std::string cert;
+  // The format of the private key. By default it is KEY_PEM. See here for more
+  // details: https://curl.se/libcurl/c/CURLOPT_SSLKEYTYPE.html.
+  KEYTYPE key_type;
+  // The private key. See here for more details:
+  // https://curl.se/libcurl/c/CURLOPT_SSLKEY.html.
+  std::string key;
+};
 
 //==============================================================================
 /// An InferenceServerHttpClient object is used to perform any kind of
@@ -95,14 +139,22 @@ class InferenceServerHttpClient : public InferenceServerClient {
 
   /// Create a client that can be used to communicate with the server.
   /// \param client Returns a new InferenceServerHttpClient object.
-  /// \param server_url The inference server name, port and optional
-  /// base path in the following format: host:port/<base-path>.
+  /// \param server_url The inference server name, port, optional
+  /// scheme and optional base path in the following format:
+  /// <scheme://>host:port/<base-path>.
   /// \param verbose If true generate verbose output when contacting
   /// the inference server.
+  /// \param ssl_options Specifies the settings for configuring
+  /// SSL encryption and authorization. Providing these options
+  /// do not ensure that SSL/TLS will be used in communication.
+  /// The use of SSL/TLS depends entirely on the server endpoint.
+  /// These options will be ignored if the server_url does not
+  /// expose `https://` scheme.
   /// \return Error object indicating success or failure.
   static Error Create(
       std::unique_ptr<InferenceServerHttpClient>* client,
-      const std::string& server_url, bool verbose = false);
+      const std::string& server_url, bool verbose = false,
+      const HttpSslOptions& ssl_options = HttpSslOptions());
 
   /// Contact the inference server and get its liveness.
   /// \param live Returns whether the server is live or not.
@@ -205,10 +257,20 @@ class InferenceServerHttpClient : public InferenceServerClient {
   /// in request.
   /// \param query_params Optional map specifying parameters that must be
   /// included with URL query.
+  /// \param config Optional JSON representation of a model config provided for
+  /// the load request, if provided, this config will be used for
+  /// loading the model.
+  /// \param files Optional map specifying file path (with "file:"
+  /// prefix) in the override model directory to the file content.
+  /// The files will form the model directory that the model
+  /// will be loaded from. If specified, 'config' must be provided to be
+  /// the model configuration of the override model directory.
   /// \return Error object indicating success or failure of the request.
   Error LoadModel(
       const std::string& model_name, const Headers& headers = Headers(),
-      const Parameters& query_params = Parameters());
+      const Parameters& query_params = Parameters(),
+      const std::string& config = std::string(),
+      const std::map<std::string, std::vector<char>>& files = {});
 
   /// Request the inference server to unload specified model.
   /// \param model_name The name of the model to be unloaded.
@@ -239,6 +301,45 @@ class InferenceServerHttpClient : public InferenceServerClient {
   Error ModelInferenceStatistics(
       std::string* infer_stat, const std::string& model_name = "",
       const std::string& model_version = "", const Headers& headers = Headers(),
+      const Parameters& query_params = Parameters());
+
+  /// Update the trace settings for the specified model name, or global trace
+  /// settings if model name is not given.
+  /// \param response Returns the JSON representation of the updated trace
+  /// settings as a string.
+  /// \param model_name The name of the model to update trace settings. The
+  /// default value is an empty string which means the global trace settings
+  /// will be updated.
+  /// \param settings The new trace setting values. Only the settings listed
+  /// will be updated. If a trace setting is listed in the map with an empty
+  /// string, that setting will be cleared.
+  /// \param headers Optional map specifying additional HTTP headers to include
+  /// in request.
+  /// \param query_params Optional map specifying parameters that must be
+  /// included with URL query.
+  /// \return Error object indicating success or failure of the request.
+  Error UpdateTraceSettings(
+      std::string* response, const std::string& model_name = "",
+      const std::map<std::string, std::vector<std::string>>& settings =
+          std::map<std::string, std::vector<std::string>>(),
+      const Headers& headers = Headers(),
+      const Parameters& query_params = Parameters());
+
+  /// Get the trace settings for the specified model name, or global trace
+  /// settings if model name is not given.
+  /// \param settings Returns the JSON representation of the trace
+  /// settings as a string.
+  /// \param model_name The name of the model to get trace settings. The
+  /// default value is an empty string which means the global trace settings
+  /// will be returned.
+  /// \param headers Optional map specifying additional HTTP headers to include
+  /// in request.
+  /// \param query_params Optional map specifying parameters that must be
+  /// included with URL query.
+  /// \return Error object indicating success or failure of the request.
+  Error GetTraceSettings(
+      std::string* settings, const std::string& model_name = "",
+      const Headers& headers = Headers(),
       const Parameters& query_params = Parameters());
 
   /// Contact the inference server and get the status for requested system
@@ -417,8 +518,94 @@ class InferenceServerHttpClient : public InferenceServerClient {
       const CompressionType response_compression_algorithm =
           CompressionType::NONE);
 
+  /// Run multiple synchronous inferences on server.
+  /// \param results Returns the results of the inferences.
+  /// \param options The options for each inference request, one set of
+  /// options may be provided and it will be used for all inference requests.
+  /// \param inputs The vector of InferInput objects describing the model inputs
+  /// for each inference request.
+  /// \param outputs Optional vector of InferRequestedOutput objects describing
+  /// how the output must be returned. If not provided then all the outputs in
+  /// the model config will be returned as default settings. And one set of
+  /// outputs may be provided and it will be used for all inference requests.
+  /// \param headers Optional map specifying additional HTTP headers to include
+  /// in request.
+  /// \param query_params Optional map specifying parameters that must be
+  /// included with URL query.
+  /// \param request_compression_algorithm Optional HTTP compression algorithm
+  /// to use for the request body on client side. Currently supports DEFLATE,
+  /// GZIP and NONE. By default, no compression is used.
+  /// \param response_compression_algorithm Optional HTTP compression algorithm
+  /// to request for the response body. Note that the response may not be
+  /// compressed if the server does not support the specified algorithm.
+  /// Currently supports DEFLATE, GZIP and NONE. By default, no compression
+  /// is used.
+  /// \return Error object indicating success or failure of the
+  /// request.
+  Error InferMulti(
+      std::vector<InferResult*>* results,
+      const std::vector<InferOptions>& options,
+      const std::vector<std::vector<InferInput*>>& inputs,
+      const std::vector<std::vector<const InferRequestedOutput*>>& outputs =
+          std::vector<std::vector<const InferRequestedOutput*>>(),
+      const Headers& headers = Headers(),
+      const Parameters& query_params = Parameters(),
+      const CompressionType request_compression_algorithm =
+          CompressionType::NONE,
+      const CompressionType response_compression_algorithm =
+          CompressionType::NONE);
+
+  /// Run multiple asynchronous inferences on server.
+  /// Once all the requests are completed, the vector of InferResult pointers
+  /// will be passed to the provided 'callback' function. Upon the invocation
+  /// of callback function, the ownership of the InferResult objects are
+  /// transfered to the function caller. It is then the caller's choice on
+  /// either retrieving the results inside the callback function or deferring it
+  /// to a different thread so that the client is unblocked. In order to
+  /// prevent memory leak, user must ensure these objects get deleted.
+  /// Note: InferInput::AppendRaw() or InferInput::SetSharedMemory() calls do
+  /// not copy the data buffers but hold the pointers to the data directly.
+  /// It is advisable to not to disturb the buffer contents until the respective
+  /// callback is invoked.
+  /// \param callback The callback function to be invoked on the completion of
+  /// all requests.
+  /// \param options The options for each inference request, one set of
+  /// option may be provided and it will be used for all inference requests.
+  /// \param inputs The vector of InferInput objects describing the model inputs
+  /// for each inference request.
+  /// \param outputs Optional vector of InferRequestedOutput objects describing
+  /// how the output must be returned. If not provided then all the outputs in
+  /// the model config will be returned as default settings. And one set of
+  /// outputs may be provided and it will be used for all inference requests.
+  /// \param headers Optional map specifying additional HTTP headers to include
+  /// in request.
+  /// \param query_params Optional map specifying parameters that must be
+  /// included with URL query.
+  /// \param request_compression_algorithm Optional HTTP compression algorithm
+  /// to use for the request body on client side. Currently supports DEFLATE,
+  /// GZIP and NONE. By default, no compression is used.
+  /// \param response_compression_algorithm Optional HTTP compression algorithm
+  /// to request for the response body. Note that the response may not be
+  /// compressed if the server does not support the specified algorithm.
+  /// Currently supports DEFLATE, GZIP and NONE. By default, no compression
+  /// is used.
+  /// \return Error object indicating success
+  /// or failure of the request.
+  Error AsyncInferMulti(
+      OnMultiCompleteFn callback, const std::vector<InferOptions>& options,
+      const std::vector<std::vector<InferInput*>>& inputs,
+      const std::vector<std::vector<const InferRequestedOutput*>>& outputs =
+          std::vector<std::vector<const InferRequestedOutput*>>(),
+      const Headers& headers = Headers(),
+      const Parameters& query_params = Parameters(),
+      const CompressionType request_compression_algorithm =
+          CompressionType::NONE,
+      const CompressionType response_compression_algorithm =
+          CompressionType::NONE);
+
  private:
-  InferenceServerHttpClient(const std::string& url, bool verbose);
+  InferenceServerHttpClient(
+      const std::string& url, bool verbose, const HttpSslOptions& ssl_options);
 
   Error PreRunProcessing(
       void* curl, std::string& request_uri, const InferOptions& options,
@@ -449,6 +636,8 @@ class InferenceServerHttpClient : public InferenceServerClient {
 
   // The server url
   const std::string url_;
+  // The options for authorizing and authenticating SSL/TLS connections
+  HttpSslOptions ssl_options_;
 
   using AsyncReqMap = std::map<uintptr_t, std::shared_ptr<HttpInferRequest>>;
   // curl easy handle shared for all synchronous requests

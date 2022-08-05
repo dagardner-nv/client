@@ -1,4 +1,4 @@
-# Copyright (c) 2020-2021, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright 2020-2022, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 #
 # Redistribution and use in source and binary forms, with or without
 # modification, are permitted provided that the following conditions
@@ -104,6 +104,7 @@ def _grpc_compression_type(algorithm_str):
     )
     return grpc.Compression.NoCompression
 
+
 class KeepAliveOptions:
     """A KeepAliveOptions object is used to encapsulate GRPC KeepAlive
     related parameters for initiating an InferenceServerclient object.
@@ -189,6 +190,15 @@ class InferenceServerClient:
         Object encapsulating various GRPC KeepAlive options. See
         the class definition for more information. Default is None.
 
+    channel_args: List[Tuple]
+        List of Tuple pairs ("key", value) to be passed directly to the GRPC
+        channel as the channel_arguments. If this argument is provided, it is
+        expected the channel arguments are correct and complete, and the
+        keepalive_options parameter will be ignored since the corresponding
+        keepalive channel arguments can be set directly in this parameter. See
+        https://grpc.github.io/grpc/python/glossary.html#term-channel_arguments
+        for more details. Default is None.
+
     Raises
     ------
     Exception
@@ -204,24 +214,31 @@ class InferenceServerClient:
                  private_key=None,
                  certificate_chain=None,
                  creds=None,
-                 keepalive_options=None):
-        # Use GRPC KeepAlive client defaults if unspecified
-        if not keepalive_options:
-            keepalive_options = KeepAliveOptions()
+                 keepalive_options=None,
+                 channel_args=None):
 
-        # FixMe: Are any of the channel options worth exposing?
-        # https://grpc.io/grpc/core/group__grpc__arg__keys.html
-        channel_opt = [
-            ('grpc.max_send_message_length', MAX_GRPC_MESSAGE_SIZE),
-            ('grpc.max_receive_message_length', MAX_GRPC_MESSAGE_SIZE),
-            ('grpc.keepalive_time_ms', keepalive_options.keepalive_time_ms),
-            ('grpc.keepalive_timeout_ms',
-                keepalive_options.keepalive_timeout_ms),
-            ('grpc.keepalive_permit_without_calls',
-                keepalive_options.keepalive_permit_without_calls),
-            ('grpc.http2.max_pings_without_data',
-                keepalive_options.http2_max_pings_without_data),
-        ]
+        # Explicitly check "is not None" here to support passing an empty
+        # list to specify setting no channel arguments.
+        if channel_args is not None:
+            channel_opt = channel_args
+        else:
+            # Use GRPC KeepAlive client defaults if unspecified
+            if not keepalive_options:
+                keepalive_options = KeepAliveOptions()
+
+            # To specify custom channel_opt, see the channel_args parameter.
+            channel_opt = [
+                ('grpc.max_send_message_length', MAX_GRPC_MESSAGE_SIZE),
+                ('grpc.max_receive_message_length', MAX_GRPC_MESSAGE_SIZE),
+                ('grpc.keepalive_time_ms', keepalive_options.keepalive_time_ms),
+                ('grpc.keepalive_timeout_ms',
+                 keepalive_options.keepalive_timeout_ms),
+                ('grpc.keepalive_permit_without_calls',
+                 keepalive_options.keepalive_permit_without_calls),
+                ('grpc.http2.max_pings_without_data',
+                 keepalive_options.http2_max_pings_without_data),
+            ]
+
         if creds:
             self._channel = grpc.secure_channel(url, creds, options=channel_opt)
         elif ssl:
@@ -605,7 +622,7 @@ class InferenceServerClient:
         except grpc.RpcError as rpc_error:
             raise_error_grpc(rpc_error)
 
-    def load_model(self, model_name, headers=None):
+    def load_model(self, model_name, headers=None, config=None, files=None):
         """Request the inference server to load or reload specified model.
 
         Parameters
@@ -615,6 +632,16 @@ class InferenceServerClient:
         headers: dict
             Optional dictionary specifying additional HTTP
             headers to include in the request.
+        config: str
+            Optional JSON representation of a model config provided for
+            the load request, if provided, this config will be used for
+            loading the model.
+        files: dict
+            Optional dictionary specifying file path (with "file:" prefix) in
+            the override model directory to the file content as bytes.
+            The files will form the model directory that the model will be
+            loaded from. If specified, 'config' must be provided to be
+            the model configuration of the override model directory.
 
         Raises
         ------
@@ -629,8 +656,15 @@ class InferenceServerClient:
         try:
             request = service_pb2.RepositoryModelLoadRequest(
                 model_name=model_name)
+            if config is not None:
+                request.parameters["config"].string_param = config
             if self._verbose:
-                print("load_model, metadata {}\n{}".format(metadata, request))
+                # Don't print file content which can be large
+                print("load_model, metadata {}\noverride files omitted:\n{}".
+                      format(metadata, request))
+            if files is not None:
+                for path, content in files.items():
+                    request.parameters[path].bytes_param = content
             self._client_stub.RepositoryModelLoad(request=request,
                                                   metadata=metadata)
             if self._verbose:
@@ -726,6 +760,138 @@ class InferenceServerClient:
                     metadata, request))
             response = self._client_stub.ModelStatistics(request=request,
                                                          metadata=metadata)
+            if self._verbose:
+                print(response)
+            if as_json:
+                return json.loads(
+                    MessageToJson(response, preserving_proto_field_name=True))
+            else:
+                return response
+        except grpc.RpcError as rpc_error:
+            raise_error_grpc(rpc_error)
+
+    def update_trace_settings(self,
+                              model_name=None,
+                              settings={},
+                              headers=None,
+                              as_json=False):
+        """Update the trace settings for the specified model name, or
+        global trace settings if model name is not given.
+        Returns the trace settings after the update.
+
+        Parameters
+        ----------
+        model_name : str
+            The name of the model to update trace settings. Specifying None or
+            empty string will update the global trace settings.
+            The default value is None.
+        settings: dict
+            The new trace setting values. Only the settings listed will be
+            updated. If a trace setting is listed in the dictionary with
+            a value of 'None', that setting will be cleared.
+        headers: dict
+            Optional dictionary specifying additional HTTP
+            headers to include in the request.
+        as_json : bool
+            If True then returns trace settings
+            as a json dict, otherwise as a protobuf message.
+            Default value is False.
+            The returned json is generated from the protobuf message
+            using MessageToJson and as a result int64 values are
+            represented as string. It is the caller's responsibility
+            to convert these strings back to int64 values as
+            necessary.
+
+        Returns
+        -------
+        dict or protobuf message
+            The JSON dict or TraceSettingResponse message holding
+            the updated trace settings.
+
+        Raises
+        ------
+        InferenceServerException
+            If unable to update the trace settings.
+
+        """
+        if headers is not None:
+            metadata = headers.items()
+        else:
+            metadata = ()
+        try:
+            request = service_pb2.TraceSettingRequest()
+            if (model_name is not None) and (model_name != ""):
+                request.model_name = model_name
+            for key, value in settings.items():
+                if value is None:
+                    request.settings[key]
+                else:
+                    request.settings[key].value.extend(
+                        value if isinstance(value, list) else [value])
+
+            if self._verbose:
+                print("update_trace_settings, metadata {}\n{}".format(
+                    metadata, request))
+            response = self._client_stub.TraceSetting(request=request,
+                                                      metadata=metadata)
+            if self._verbose:
+                print(response)
+            if as_json:
+                return json.loads(
+                    MessageToJson(response, preserving_proto_field_name=True))
+            else:
+                return response
+        except grpc.RpcError as rpc_error:
+            raise_error_grpc(rpc_error)
+
+    def get_trace_settings(self, model_name=None, headers=None, as_json=False):
+        """Get the trace settings for the specified model name, or global trace
+        settings if model name is not given
+
+        Parameters
+        ----------
+        model_name : str
+            The name of the model to get trace settings. Specifying None or
+            empty string will return the global trace settings.
+            The default value is None.
+        headers: dict
+            Optional dictionary specifying additional HTTP
+            headers to include in the request.
+        as_json : bool
+            If True then returns trace settings
+            as a json dict, otherwise as a protobuf message.
+            Default value is False.
+            The returned json is generated from the protobuf message
+            using MessageToJson and as a result int64 values are
+            represented as string. It is the caller's responsibility
+            to convert these strings back to int64 values as
+            necessary.
+
+        Returns
+        -------
+        dict or protobuf message
+            The JSON dict or TraceSettingResponse message holding
+            the trace settings.
+
+        Raises
+        ------
+        InferenceServerException
+            If unable to get the trace settings.
+
+        """
+        if headers is not None:
+            metadata = headers.items()
+        else:
+            metadata = ()
+        try:
+            request = service_pb2.TraceSettingRequest()
+            if (model_name is not None) and (model_name != ""):
+                request.model_name = model_name
+            if self._verbose:
+                print("get_trace_settings, metadata {}\n{}".format(
+                    metadata, request))
+            response = self._client_stub.TraceSetting(request=request,
+                                                      metadata=metadata)
             if self._verbose:
                 print(response)
             if as_json:
@@ -1533,11 +1699,19 @@ class InferInput:
         """
         if not isinstance(input_tensor, (np.ndarray,)):
             raise_error("input_tensor must be a numpy array")
-        dtype = np_to_triton_dtype(input_tensor.dtype)
-        if self._input.datatype != dtype:
-            raise_error(
-                "got unexpected datatype {} from numpy array, expected {}".
-                format(dtype, self._input.datatype))
+        # DLIS-3986: Special handling for bfloat16 until Numpy officially supports it
+        if self._input.datatype == "BF16":
+            if input_tensor.dtype != triton_to_np_dtype(self._input.datatype):
+                raise_error(
+                    "got unexpected datatype {} from numpy array, expected {} for BF16 type"
+                    .format(input_tensor.dtype,
+                            triton_to_np_dtype(self._input.datatype)))
+        else:
+            dtype = np_to_triton_dtype(input_tensor.dtype)
+            if self._input.datatype != dtype:
+                raise_error(
+                    "got unexpected datatype {} from numpy array, expected {}".
+                    format(dtype, self._input.datatype))
         valid_shape = True
         if len(self._input.shape) != len(input_tensor.shape):
             valid_shape = False
@@ -1556,6 +1730,12 @@ class InferInput:
 
         if self._input.datatype == "BYTES":
             serialized_output = serialize_byte_tensor(input_tensor)
+            if serialized_output.size > 0:
+                self._raw_content = serialized_output.item()
+            else:
+                self._raw_content = b''
+        elif self._input.datatype == "BF16":
+            serialized_output = serialize_bf16_tensor(input_tensor)
             if serialized_output.size > 0:
                 self._raw_content = serialized_output.item()
             else:
@@ -1731,6 +1911,9 @@ class InferResult:
                         # need to decode the raw bytes to convert into
                         # array elements.
                         np_array = deserialize_bytes_tensor(
+                            self._result.raw_output_contents[index])
+                    elif datatype == "BF16":
+                        np_array = deserialize_bf16_tensor(
                             self._result.raw_output_contents[index])
                     else:
                         np_array = np.frombuffer(

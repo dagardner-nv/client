@@ -1,4 +1,4 @@
-// Copyright (c) 2020, NVIDIA CORPORATION. All rights reserved.
+// Copyright 2020-2022, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 //
 // Redistribution and use in source and binary forms, with or without
 // modification, are permitted provided that the following conditions
@@ -46,7 +46,8 @@ GetInt(const rapidjson::Value& value, int64_t* integer_value)
     }
     catch (...) {
       return cb::Error(
-          std::string("unable to convert '") + str + "' to integer");
+          std::string("unable to convert '") + str + "' to integer",
+          pa::GENERIC_ERROR);
     }
 
   } else if (value.IsInt64()) {
@@ -54,7 +55,7 @@ GetInt(const rapidjson::Value& value, int64_t* integer_value)
   } else if (value.IsInt()) {
     *integer_value = value.GetInt();
   } else {
-    return cb::Error("failed to parse the integer value");
+    return cb::Error("failed to parse the integer value", pa::GENERIC_ERROR);
   }
 
   return cb::Error::Success;
@@ -153,11 +154,18 @@ ModelParser::InitTriton(
           input_config["name"].GetStringLength());
       auto it = inputs_->find(name);
       if (it == inputs_->end()) {
-        return cb::Error("no metadata found for input tensor " + name);
+        return cb::Error(
+            "no metadata found for input tensor " + name, pa::GENERIC_ERROR);
       }
       const auto& shape_tensor_itr = input_config.FindMember("is_shape_tensor");
       if (shape_tensor_itr != input_config.MemberEnd()) {
         it->second.is_shape_tensor_ = shape_tensor_itr->value.GetBool();
+      }
+
+      if (input_config.HasMember("optional")) {
+        it->second.is_optional_ = input_config["optional"].GetBool();
+      } else {
+        it->second.is_optional_ = false;
       }
     }
   }
@@ -192,7 +200,8 @@ ModelParser::InitTriton(
           output_config["name"].GetStringLength());
       auto itr = outputs_->find(name);
       if (itr == outputs_->end()) {
-        return cb::Error("no metadata found for output tensor " + name);
+        return cb::Error(
+            "no metadata found for output tensor " + name, pa::GENERIC_ERROR);
       }
       const auto& shape_tensor_itr =
           output_config.FindMember("is_shape_tensor");
@@ -201,6 +210,15 @@ ModelParser::InitTriton(
       }
     }
   }
+
+  // Check if model has response caching enabled
+  const auto cache_itr = config.FindMember("response_cache");
+  // response_cache_enabled_ set globally for reporting purposes if any
+  // composing model has it enabled, so don't overwrite it if already set
+  if (cache_itr != config.MemberEnd() && !response_cache_enabled_) {
+    response_cache_enabled_ = cache_itr->value["enable"].GetBool();
+  }
+
   return cb::Error::Success;
 }
 
@@ -227,7 +245,8 @@ ModelParser::InitTFServe(
   if (!signature_config.HasMember(model_signature_name.c_str())) {
     return cb::Error(
         "Failed to find signature_name \"" + model_signature_name +
-        "\" in the metadata");
+            "\" in the metadata",
+        pa::GENERIC_ERROR);
   }
 
   // Get the information about inputs from metadata
@@ -247,7 +266,8 @@ ModelParser::InitTFServe(
         if (max_batch_size_ != 0) {
           return cb::Error(
               "Can not specify -b flag for saved model with unknown ranked "
-              "inputs");
+              "inputs",
+              pa::GENERIC_ERROR);
         }
         is_dynamic = true;
       } else {
@@ -260,7 +280,8 @@ ModelParser::InitTFServe(
             if (dim_int != -1) {
               return cb::Error(
                   "Can not specify -b flag for saved model with input not "
-                  "having their first dim as -1");
+                  "having their first dim as -1",
+                  pa::GENERIC_ERROR);
             }
             first_dim = false;
           } else {
@@ -345,6 +366,14 @@ ModelParser::GetEnsembleSchedulerType(
           &model_config, step["model_name"].GetString(), step_model_version));
       RETURN_IF_ERROR(GetEnsembleSchedulerType(
           model_config, step_model_version, backend, is_sequential));
+
+      // Check if composing model has response caching enabled.
+      const auto cache_itr = model_config.FindMember("response_cache");
+      // response_cache_enabled_ set globally for reporting purposes if any
+      // composing model has it enabled, so don't overwrite it if already set
+      if (cache_itr != model_config.MemberEnd() && !response_cache_enabled_) {
+        response_cache_enabled_ = cache_itr->value["enable"].GetBool();
+      }
     }
   }
 

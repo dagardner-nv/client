@@ -1,4 +1,4 @@
-# Copyright (c) 2020-2021, NVIDIA CORPORATION. All rights reserved.
+# Copyright 2020-2022, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 #
 # Redistribution and use in source and binary forms, with or without
 # modification, are permitted provided that the following conditions
@@ -29,6 +29,7 @@ cmake_minimum_required (VERSION 3.18)
 if(${TRITON_ENABLE_PYTHON_HTTP})
   install(
     PROGRAMS
+      simple_http_aio_infer_client.py
       simple_http_health_metadata.py
       simple_http_infer_client.py
       simple_http_string_infer_client.py
@@ -56,6 +57,8 @@ if(${TRITON_ENABLE_PYTHON_GRPC})
       grpc_explicit_int_content_client.py
       grpc_explicit_int8_content_client.py
       grpc_image_client.py
+      simple_grpc_aio_infer_client.py
+      simple_grpc_aio_sequence_stream_infer_client.py
       simple_grpc_custom_repeat.py
       simple_grpc_health_metadata.py
       simple_grpc_async_infer_client.py
@@ -66,6 +69,8 @@ if(${TRITON_ENABLE_PYTHON_GRPC})
       simple_grpc_shm_client.py
       simple_grpc_shm_string_client.py
       simple_grpc_model_control.py
+      simple_grpc_keepalive_client.py
+      simple_grpc_custom_args_client.py
     DESTINATION python
   )
   if(${TRITON_ENABLE_GPU})

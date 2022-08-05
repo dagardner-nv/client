@@ -1,4 +1,4 @@
-// Copyright (c) 2020-2021, NVIDIA CORPORATION. All rights reserved.
+// Copyright 2020-2022, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 //
 // Redistribution and use in source and binary forms, with or without
 // modification, are permitted provided that the following conditions
@@ -25,13 +25,21 @@
 // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #pragma once
 
+#include <deque>
 #include <thread>
+#include <tuple>
 #include "concurrency_manager.h"
+#include "constants.h"
 #include "custom_load_manager.h"
 #include "model_parser.h"
+#include "mpi_utils.h"
 #include "request_rate_manager.h"
 
 namespace triton { namespace perfanalyzer {
+
+#ifndef DOCTEST_CONFIG_DISABLE
+class TestInferenceProfiler;
+#endif
 
 /// Constant parameters that determine the whether stopping criteria has met
 /// for the current phase of testing
@@ -61,9 +69,21 @@ enum MeasurementMode { TIME_WINDOWS = 0, COUNT_WINDOWS = 1 };
 // Holds the total of the timiming components of composing models of an
 // ensemble.
 struct EnsembleDurations {
-  EnsembleDurations() : total_queue_time_us(0), total_compute_time_us(0) {}
-  uint64_t total_queue_time_us;
-  uint64_t total_compute_time_us;
+  EnsembleDurations()
+      : total_queue_time_avg_us(0), total_compute_time_avg_us(0),
+        total_cache_hit_time_avg_us(0), total_cache_miss_time_avg_us(0),
+        total_combined_cache_compute_time_avg_us(0)
+  {
+  }
+  uint64_t total_queue_time_avg_us;
+  uint64_t total_compute_time_avg_us;
+  // Time spent on cache lookups/copies for cache hits
+  uint64_t total_cache_hit_time_avg_us;
+  // Time spent on cache lookups/copies/insertions for cache misses
+  uint64_t total_cache_miss_time_avg_us;
+
+  // Combined average of cache and compute times
+  uint64_t total_combined_cache_compute_time_avg_us;
 };
 
 /// Holds the server-side inference statisitcs of the target model and its
@@ -71,12 +91,22 @@ struct EnsembleDurations {
 struct ServerSideStats {
   uint64_t inference_count;
   uint64_t execution_count;
+  uint64_t cache_hit_count;
+  uint64_t cache_miss_count;
   uint64_t success_count;
+  uint64_t queue_count;
+  uint64_t compute_input_count;
+  uint64_t compute_infer_count;
+  uint64_t compute_output_count;
   uint64_t cumm_time_ns;
   uint64_t queue_time_ns;
   uint64_t compute_input_time_ns;
   uint64_t compute_infer_time_ns;
   uint64_t compute_output_time_ns;
+  // Time spent on cache lookups/copies for cache hits
+  uint64_t cache_hit_time_ns;
+  // Time spent on cache lookups/copies/insertions for cache misses
+  uint64_t cache_miss_time_ns;
 
   std::map<cb::ModelIdentifier, ServerSideStats> composing_models_stat;
 };
@@ -93,6 +123,8 @@ struct ClientSideStats {
   uint64_t avg_latency_ns;
   // a ordered map of percentiles to be reported (<percentile, value> pair)
   std::map<size_t, uint64_t> percentile_latency_ns;
+  // List of all the valid latencies.
+  std::vector<uint64_t> latencies;
   // Using usec to avoid square of large number (large in nsec)
   uint64_t std_us;
   uint64_t avg_request_time_ns;
@@ -101,6 +133,9 @@ struct ClientSideStats {
   // Per sec stat
   double infer_per_sec;
   double sequence_per_sec;
+
+  // Completed request count reported by the client library
+  uint64_t completed_count;
 };
 
 /// The entire statistics record.
@@ -164,6 +199,7 @@ class InferenceProfiler {
   /// \param measurement_request_count The number of requests to capture when
   /// using "count_windows" mode.
   /// \param measurement_mode The measurement mode to use for windows.
+  /// \param mpi_driver The driver class for MPI operations.
   /// \return cb::Error object indicating success or
   /// failure.
   static cb::Error Create(
@@ -174,7 +210,8 @@ class InferenceProfiler {
       std::unique_ptr<cb::ClientBackend> profile_backend,
       std::unique_ptr<LoadManager> manager,
       std::unique_ptr<InferenceProfiler>* profiler,
-      uint64_t measurement_request_count, MeasurementMode measurement_mode);
+      uint64_t measurement_request_count, MeasurementMode measurement_mode,
+      std::shared_ptr<MPIDriver> mpi_driver);
 
   /// Performs the profiling on the given range with the given search algorithm.
   /// For profiling using request rate invoke template with double, otherwise
@@ -193,28 +230,34 @@ class InferenceProfiler {
       std::vector<PerfStatus>& summary)
   {
     cb::Error err;
-    bool meets_threshold;
+    bool meets_threshold, is_stable;
     if (search_mode == SearchMode::NONE) {
-      err = Profile(summary, &meets_threshold);
+      err = Profile(summary, meets_threshold, is_stable);
       if (!err.IsOk()) {
         return err;
       }
     } else if (search_mode == SearchMode::LINEAR) {
       T current_value = start;
       do {
-        err = Profile(current_value, summary, &meets_threshold);
+        err = Profile(current_value, summary, meets_threshold, is_stable);
         if (!err.IsOk()) {
           return err;
         }
         current_value += step;
       } while (((current_value <= end) || (end == static_cast<T>(NO_LIMIT))) &&
                (meets_threshold));
+      // If there was only one concurrency we swept over and it did not meet the
+      // stability threshold, we should return an error.
+      if (current_value == (start + step) && is_stable == false) {
+        return cb::Error(
+            "Failed to obtain stable measurement.", pa::STABILITY_ERROR);
+      }
     } else {
-      err = Profile(start, summary, &meets_threshold);
+      err = Profile(start, summary, meets_threshold, is_stable);
       if (!err.IsOk() || (!meets_threshold)) {
         return err;
       }
-      err = Profile(end, summary, &meets_threshold);
+      err = Profile(end, summary, meets_threshold, is_stable);
       if (!err.IsOk() || (meets_threshold)) {
         return err;
       }
@@ -223,7 +266,7 @@ class InferenceProfiler {
       T this_end = end;
       while ((this_end - this_start) > step) {
         T current_value = (this_end + this_start) / 2;
-        err = Profile(current_value, summary, &meets_threshold);
+        err = Profile(current_value, summary, meets_threshold, is_stable);
         if (!err.IsOk()) {
           return err;
         }
@@ -248,7 +291,7 @@ class InferenceProfiler {
       std::shared_ptr<ModelParser>& parser,
       std::unique_ptr<cb::ClientBackend> profile_backend,
       std::unique_ptr<LoadManager> manager, uint64_t measurement_request_count,
-      MeasurementMode measurement_mode);
+      MeasurementMode measurement_mode, std::shared_ptr<MPIDriver> mpi_driver);
 
   /// Actively measure throughput in every 'measurement_window' msec until the
   /// throughput is stable. Once the throughput is stable, it adds the
@@ -261,29 +304,33 @@ class InferenceProfiler {
   /// \param concurrent_request_count The concurrency level for the measurement.
   /// \param summary Appends the measurements summary at the end of this list.
   /// \param meets_threshold Returns whether the setting meets the threshold.
+  /// \param is_stable Returns whether the measurement is stable.
   /// \return cb::Error object indicating success or failure.
   cb::Error Profile(
       const size_t concurrent_request_count, std::vector<PerfStatus>& summary,
-      bool* meets_threshold);
+      bool& meets_threshold, bool& is_stable);
 
-  /// Similar to above function, but instead of setting the concurrency, it sets
-  /// the specified request rate for measurements.
+  /// Similar to above function, but instead of setting the concurrency, it
+  /// sets the specified request rate for measurements.
   /// \param request_rate The request rate for inferences.
   /// \param summary Appends the measurements summary at the end of this list.
   /// \param meets_threshold Returns whether the setting meets the threshold.
+  /// \param is_stable Returns whether the measurement is stable.
   /// \return cb::Error object indicating success or failure.
   cb::Error Profile(
       const double request_rate, std::vector<PerfStatus>& summary,
-      bool* meets_threshold);
+      bool& meets_threshold, bool& is_stable);
 
   /// Measures throughput and latencies for custom load without controling
   /// request rate nor concurrency. Requires load manager to be loaded with
   /// a file specifying the time intervals.
   /// \param summary Appends the measurements summary at the end of this list.
   /// \param meets_threshold Returns whether the measurement met the threshold.
+  /// \param is_stable Returns whether the measurement is stable.
   /// \return cb::Error object indicating success
   /// or failure.
-  cb::Error Profile(std::vector<PerfStatus>& summary, bool* meets_threshold);
+  cb::Error Profile(
+      std::vector<PerfStatus>& summary, bool& meets_threshold, bool& is_stable);
 
   /// A helper function for profiling functions.
   /// \param clean_starts Whether or not to reset load cycle with every
@@ -293,6 +340,45 @@ class InferenceProfiler {
   /// \return cb::Error object indicating success or failure.
   cb::Error ProfileHelper(
       const bool clean_starts, PerfStatus& status_summary, bool* is_stable);
+
+  /// A helper function to determine if profiling is stable
+  /// \param load_status Stores the observations of infer_per_sec and latencies
+  /// \return Returns if the threshold and latencies are stable.
+  bool DetermineStability(LoadStatus& load_status);
+
+  /// Check if latency at index idx is within the latency threshold
+  /// \param idx index in latency vector
+  /// \param load_status Stores the observations of infer_per_sec and latencies
+  /// \return Returns whether the latencies are below the max threshold
+  bool CheckWithinThreshold(size_t idx, LoadStatus& load_status);
+
+  /// A helper function to determine if profiling is done
+  /// \param load_status Stores the observations of infer_per_sec and latencies
+  /// \param is_stable Returns whether the measurement stabilized or not.
+  /// \return Returns if we should break out of the infinite stability check
+  /// loop.
+  bool IsDoneProfiling(LoadStatus& load_status, bool* is_stable);
+
+  /// Check if observed inferences and latencies are within threshold
+  /// for a single window starting at idx
+  /// \param idx index in latency vector
+  /// \param load_status Stores the observations of infer_per_sec and latencies
+  /// \return Returns whether inference and latency are stable
+  bool CheckWindowForStability(size_t idx, LoadStatus& load_status);
+
+  /// Check if observed inferences are within threshold
+  /// for a single window starting at idx
+  /// \param idx index in latency vector
+  /// \param load_status Stores the observations of infer_per_sec and latencies
+  /// \return Returns whether inference is stable
+  bool IsInferWindowStable(size_t idx, LoadStatus& load_status);
+
+  /// Check if observed latencies are within threshold
+  /// for a single window starting at idx
+  /// \param idx index in latency vector
+  /// \param load_status Stores the observations of infer_per_sec and latencies
+  /// \return Returns whether latency is stable
+  bool IsLatencyWindowStable(size_t idx, LoadStatus& load_status);
 
   /// Helper function to perform measurement.
   /// \param status_summary The summary of this measurement.
@@ -315,31 +401,20 @@ class InferenceProfiler {
       std::map<cb::ModelIdentifier, cb::ModelStatistics>* model_status);
 
   /// Sumarize the measurement with the provided statistics.
-  /// \param timestamps The timestamps of the requests completed during the
-  /// measurement.
   /// \param start_status The model status at the start of the measurement.
   /// \param end_status The model status at the end of the measurement.
   /// \param start_stat The accumulated context status at the start.
   /// \param end_stat The accumulated context status at the end.
   /// \param summary Returns the summary of the measurement.
+  /// \param window_start_ns The window start timestamp in nanoseconds.
+  /// \param window_end_ns The window end timestamp in nanoseconds.
   /// \return cb::Error object indicating success or failure.
   cb::Error Summarize(
-      const TimestampVector& timestamps,
       const std::map<cb::ModelIdentifier, cb::ModelStatistics>& start_status,
       const std::map<cb::ModelIdentifier, cb::ModelStatistics>& end_status,
       const cb::InferStat& start_stat, const cb::InferStat& end_stat,
-      PerfStatus& summary, long long measurement_window_ms);
+      PerfStatus& summary, uint64_t window_start_ns, uint64_t window_end_ns);
 
-  /// A helper function to get the start and end of a measurement window.
-  /// \param timestamps The timestamps collected for the measurement.
-  /// \param valid_range Returns the start and end timestamp of the measurement
-  /// window.
-  void MeasurementTimestamp(
-      const TimestampVector& timestamps,
-      std::pair<uint64_t, uint64_t>* valid_range,
-      long long measurement_window_ms);
-
-  /// \param timestamps The timestamps collected for the measurement.
   /// \param valid_range The start and end timestamp of the measurement window.
   /// \param valid_sequence_count Returns the number of completed sequences
   /// during the measurement. A sequence is a set of correlated requests sent to
@@ -347,7 +422,6 @@ class InferenceProfiler {
   /// \param latencies Returns the vector of request latencies where the
   /// requests are completed within the measurement window.
   void ValidLatencyMeasurement(
-      const TimestampVector& timestamps,
       const std::pair<uint64_t, uint64_t>& valid_range,
       size_t& valid_sequence_count, size_t& delayed_request_count,
       std::vector<uint64_t>* latencies);
@@ -358,6 +432,13 @@ class InferenceProfiler {
   /// \return cb::Error object indicating success or failure.
   cb::Error SummarizeLatency(
       const std::vector<uint64_t>& latencies, PerfStatus& summary);
+
+  /// \param latencies The vector of request latencies collected.
+  /// \return std::tuple object containing:
+  ///   * mean of latencies in nanoseconds
+  ///   * sample standard deviation of latencies in microseconds
+  std::tuple<uint64_t, uint64_t> GetMeanAndStdDev(
+      const std::vector<uint64_t>& latencies);
 
   /// \param start_stat The accumulated client statistics at the start.
   /// \param end_stat The accumulated client statistics at the end.
@@ -411,6 +492,30 @@ class InferenceProfiler {
       const std::map<cb::ModelIdentifier, cb::ModelStatistics>& end_status,
       ServerSideStats* server_stats);
 
+  /// Returns true if all MPI ranks (models) are stable. Should only be run if
+  /// and only if IsMPIRun() returns true.
+  /// \param current_rank_stability The stability of the current rank.
+  /// \return True if all MPI ranks are stable.
+  bool AllMPIRanksAreStable(bool current_rank_stability);
+
+  /// Merge individual perf status reports into a single perf status.  This
+  /// function is used to merge the results from multiple Measure runs into a
+  /// single report.
+  /// \param perf_status List of perf status reports to be merged.
+  /// \param summary_status Final merged summary status.
+  /// \return cb::Error object indicating success or failure.
+  cb::Error MergePerfStatusReports(
+      std::deque<PerfStatus>& perf_status, PerfStatus& summary_status);
+
+  /// Merge individual server side statistics into a single server side report.
+  /// \param server_side_stats List of server side statistics reports to be
+  /// merged.
+  /// \param server_side_summary Final merged summary status.
+  /// \return cb::Error object indicating success or failure.
+  cb::Error MergeServerSideStats(
+      std::vector<ServerSideStats>& server_side_stats,
+      ServerSideStats& server_side_summary);
+
   bool verbose_;
   uint64_t measurement_window_ms_;
   uint64_t measurement_request_count_;
@@ -431,6 +536,25 @@ class InferenceProfiler {
 
   bool include_lib_stats_;
   bool include_server_stats_;
-};
+  std::shared_ptr<MPIDriver> mpi_driver_;
 
+  /// The timestamps of the requests completed during all measurements
+  TimestampVector all_timestamps_;
+
+  /// The end time of the previous measurement window
+  uint64_t previous_window_end_ns_;
+
+  /// Server side statistics from the previous measurement window
+  std::map<cb::ModelIdentifier, cb::ModelStatistics> prev_server_side_stats_;
+
+  /// Client side statistics from the previous measurement window
+  cb::InferStat prev_client_side_stats_;
+
+#ifndef DOCTEST_CONFIG_DISABLE
+  friend TestInferenceProfiler;
+
+ protected:
+  InferenceProfiler() = default;
+#endif
+};
 }}  // namespace triton::perfanalyzer

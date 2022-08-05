@@ -1,4 +1,4 @@
-// Copyright (c) 2020-2021, NVIDIA CORPORATION. All rights reserved.
+// Copyright 2020-2022, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 //
 // Redistribution and use in source and binary forms, with or without
 // modification, are permitted provided that the following conditions
@@ -30,15 +30,17 @@
 #include <algorithm>
 #include <limits>
 #include <queue>
-
+#include "doctest.h"
 
 namespace triton { namespace perfanalyzer {
-
 namespace {
 
 inline uint64_t
 AverageDurationInUs(const uint64_t total_time_in_ns, const uint64_t cnt)
 {
+  if (cnt == 0) {
+    return 0;
+  }
   return total_time_in_ns / (cnt * 1000);
 }
 
@@ -48,21 +50,50 @@ GetTotalEnsembleDurations(const ServerSideStats& stats)
   EnsembleDurations result;
   for (const auto& model_stats : stats.composing_models_stat) {
     if (model_stats.second.composing_models_stat.empty()) {
-      const uint64_t cnt = model_stats.second.success_count;
-      if (cnt != 0) {
-        result.total_queue_time_us +=
-            AverageDurationInUs(model_stats.second.queue_time_ns, cnt);
-        result.total_compute_time_us +=
-            AverageDurationInUs(model_stats.second.compute_input_time_ns, cnt) +
-            AverageDurationInUs(model_stats.second.compute_infer_time_ns, cnt) +
-            AverageDurationInUs(model_stats.second.compute_output_time_ns, cnt);
+      // Cache hit count covers cache hits, not related to compute times
+      const uint64_t cache_hit_cnt = model_stats.second.cache_hit_count;
+      // cache_miss_cnt should either equal infer_cnt or be zero if
+      // cache is disabled or not supported for the model/scheduler type
+      const uint64_t cache_miss_cnt = model_stats.second.cache_miss_count;
+
+      result.total_queue_time_avg_us += AverageDurationInUs(
+          model_stats.second.queue_time_ns, model_stats.second.queue_count);
+      const uint64_t compute_time = model_stats.second.compute_input_time_ns +
+                                    model_stats.second.compute_infer_time_ns +
+                                    model_stats.second.compute_output_time_ns;
+      if (model_stats.second.compute_input_count !=
+              model_stats.second.compute_infer_count ||
+          model_stats.second.compute_infer_count !=
+              model_stats.second.compute_output_count) {
+        throw std::runtime_error(
+            "Server side statistics compute counts must be the same.");
       }
+      const uint64_t compute_cnt = model_stats.second.compute_input_count;
+      result.total_compute_time_avg_us +=
+          AverageDurationInUs(compute_time, compute_cnt);
+      result.total_cache_hit_time_avg_us += AverageDurationInUs(
+          model_stats.second.cache_hit_time_ns, cache_hit_cnt);
+      result.total_cache_miss_time_avg_us += AverageDurationInUs(
+          model_stats.second.cache_miss_time_ns, cache_miss_cnt);
+      // Track combined cache/compute total avg for reporting latency with cache
+      // enabled
+      result.total_combined_cache_compute_time_avg_us += AverageDurationInUs(
+          compute_time + model_stats.second.cache_hit_time_ns +
+              model_stats.second.cache_miss_time_ns,
+          compute_cnt + cache_hit_cnt);
     } else {
       const auto this_ensemble_duration =
           GetTotalEnsembleDurations(model_stats.second);
-      result.total_queue_time_us += this_ensemble_duration.total_queue_time_us;
-      result.total_compute_time_us +=
-          this_ensemble_duration.total_compute_time_us;
+      result.total_queue_time_avg_us +=
+          this_ensemble_duration.total_queue_time_avg_us;
+      result.total_compute_time_avg_us +=
+          this_ensemble_duration.total_compute_time_avg_us;
+      result.total_cache_hit_time_avg_us +=
+          this_ensemble_duration.total_cache_hit_time_avg_us;
+      result.total_cache_miss_time_avg_us +=
+          this_ensemble_duration.total_cache_miss_time_avg_us;
+      result.total_combined_cache_compute_time_avg_us +=
+          this_ensemble_duration.total_combined_cache_compute_time_avg_us;
     }
   }
   return result;
@@ -78,13 +109,22 @@ GetOverheadDuration(size_t total_time, size_t queue_time, size_t compute_time)
 }
 
 cb::Error
-ReportServerSideStats(const ServerSideStats& stats, const int iteration)
+ReportServerSideStats(
+    const ServerSideStats& stats, const int iteration,
+    const std::shared_ptr<ModelParser>& parser)
 {
   const std::string ident = std::string(2 * iteration, ' ');
 
+  // Infer/exec counts cover compute time done in inference backends,
+  // not related to cache hit times
   const uint64_t exec_cnt = stats.execution_count;
   const uint64_t infer_cnt = stats.inference_count;
+  // Cache hit count covers cache hits, not related to compute times
+  const uint64_t cache_hit_cnt = stats.cache_hit_count;
+  const uint64_t cache_miss_cnt = stats.cache_miss_count;
 
+  // Success count covers all successful requests, cumulative time, queue
+  // time, compute, and cache
   const uint64_t cnt = stats.success_count;
   if (cnt == 0) {
     std::cout << ident << "  Request count: " << cnt << std::endl;
@@ -94,46 +134,132 @@ ReportServerSideStats(const ServerSideStats& stats, const int iteration)
   const uint64_t cumm_avg_us = AverageDurationInUs(stats.cumm_time_ns, cnt);
 
   std::cout << ident << "  Inference count: " << infer_cnt << std::endl
-            << ident << "  Execution count: " << exec_cnt << std::endl
-            << ident << "  Successful request count: " << exec_cnt << std::endl
+            << ident << "  Execution count: " << exec_cnt << std::endl;
+  if (parser->ResponseCacheEnabled()) {
+    std::cout << ident << "  Cache hit count: " << cache_hit_cnt << std::endl;
+    std::cout << ident << "  Cache miss count: " << cache_miss_cnt << std::endl;
+  }
+  std::cout << ident << "  Successful request count: " << cnt << std::endl
             << ident << "  Avg request latency: " << cumm_avg_us << " usec";
-  if (stats.composing_models_stat.empty()) {
-    const uint64_t queue_avg_us = AverageDurationInUs(stats.queue_time_ns, cnt);
-    const uint64_t compute_input_avg_us =
-        AverageDurationInUs(stats.compute_input_time_ns, cnt);
-    const uint64_t compute_infer_avg_us =
-        AverageDurationInUs(stats.compute_infer_time_ns, cnt);
-    const uint64_t compute_output_avg_us =
-        AverageDurationInUs(stats.compute_output_time_ns, cnt);
-    const uint64_t compute_avg_us =
-        compute_input_avg_us + compute_infer_avg_us + compute_output_avg_us;
-    std::cout << " (overhead "
-              << GetOverheadDuration(cumm_avg_us, queue_avg_us, compute_avg_us)
-              << " usec + "
-              << "queue " << queue_avg_us << " usec + "
-              << "compute input " << compute_input_avg_us << " usec + "
-              << "compute infer " << compute_infer_avg_us << " usec + "
-              << "compute output " << compute_output_avg_us << " usec)"
-              << std::endl
-              << std::endl;
-  } else {
-    const auto ensemble_times = GetTotalEnsembleDurations(stats);
-    std::cout << " (overhead "
-              << GetOverheadDuration(
-                     cumm_avg_us, ensemble_times.total_queue_time_us,
-                     ensemble_times.total_compute_time_us)
-              << " usec + "
-              << "queue " << ensemble_times.total_queue_time_us << " usec + "
-              << "compute " << ensemble_times.total_compute_time_us << " usec)"
-              << std::endl
-              << std::endl;
 
+  // Non-ensemble model
+  if (stats.composing_models_stat.empty()) {
+    const uint64_t queue_avg_us =
+        AverageDurationInUs(stats.queue_time_ns, stats.queue_count);
+    const uint64_t compute_input_avg_us = AverageDurationInUs(
+        stats.compute_input_time_ns, stats.compute_input_count);
+    const uint64_t compute_infer_avg_us = AverageDurationInUs(
+        stats.compute_infer_time_ns, stats.compute_infer_count);
+    const uint64_t compute_output_avg_us = AverageDurationInUs(
+        stats.compute_output_time_ns, stats.compute_output_count);
+    const uint64_t compute_time = stats.compute_input_time_ns +
+                                  stats.compute_infer_time_ns +
+                                  stats.compute_output_time_ns;
+    if (stats.compute_input_count != stats.compute_infer_count ||
+        stats.compute_infer_count != stats.compute_output_count) {
+      throw std::runtime_error(
+          "Server side statistics compute counts must be the same.");
+    }
+    const uint64_t compute_cnt = stats.compute_input_count;
+    const uint64_t compute_avg_us =
+        AverageDurationInUs(compute_time, compute_cnt);
+    const uint64_t cache_hit_avg_us =
+        AverageDurationInUs(stats.cache_hit_time_ns, cache_hit_cnt);
+    const uint64_t cache_miss_avg_us =
+        AverageDurationInUs(stats.cache_miss_time_ns, cache_miss_cnt);
+    const uint64_t total_compute_time_ns = stats.compute_input_time_ns +
+                                           stats.compute_infer_time_ns +
+                                           stats.compute_output_time_ns;
+    // Get the average of cache hits and misses across successful requests
+    const uint64_t combined_cache_compute_avg_us = AverageDurationInUs(
+        stats.cache_hit_time_ns + stats.cache_miss_time_ns +
+            total_compute_time_ns,
+        compute_cnt + cache_hit_cnt);
+
+    if (parser->ResponseCacheEnabled()) {
+      const uint64_t overhead_avg_us = GetOverheadDuration(
+          cumm_avg_us, queue_avg_us, combined_cache_compute_avg_us);
+
+      std::cout << " (overhead " << overhead_avg_us << " usec + "
+                << "queue " << queue_avg_us << " usec + "
+                << "cache hit/miss " << combined_cache_compute_avg_us
+                << " usec)" << std::endl;
+      std::cout << ident << ident
+                << "  Average Cache Hit Latency: " << cache_hit_avg_us
+                << " usec" << std::endl;
+      std::cout << ident << ident << "  Average Cache Miss Latency: "
+                << cache_miss_avg_us + compute_avg_us << " usec "
+                << "(cache lookup/insertion " << cache_miss_avg_us << " usec + "
+                << "compute input " << compute_input_avg_us << " usec + "
+                << "compute infer " << compute_infer_avg_us << " usec + "
+                << "compute output " << compute_output_avg_us << " usec)"
+                << std::endl
+                << std::endl;
+    }
+    // Response Cache Disabled
+    else {
+      std::cout << " (overhead "
+                << GetOverheadDuration(
+                       cumm_avg_us, queue_avg_us, compute_avg_us)
+                << " usec + "
+                << "queue " << queue_avg_us << " usec + "
+                << "compute input " << compute_input_avg_us << " usec + "
+                << "compute infer " << compute_infer_avg_us << " usec + "
+                << "compute output " << compute_output_avg_us << " usec)"
+                << std::endl
+                << std::endl;
+
+      if (cache_hit_avg_us > 0 || cache_miss_avg_us > 0) {
+        std::cerr << "Response Cache is disabled for model ["
+                  << parser->ModelName()
+                  << "] but cache hit/miss latency is non-zero." << std::endl;
+      }
+    }
+  }
+  // Ensemble Model
+  else {
+    const auto ensemble_times = GetTotalEnsembleDurations(stats);
+    // Response Cache Enabled
+    if (parser->ResponseCacheEnabled()) {
+      const uint64_t overhead_avg_us = GetOverheadDuration(
+          cumm_avg_us, ensemble_times.total_queue_time_avg_us,
+          ensemble_times.total_combined_cache_compute_time_avg_us);
+      std::cout << " (overhead " << overhead_avg_us << " usec + "
+                << "queue " << ensemble_times.total_queue_time_avg_us
+                << " usec + "
+                << "cache hit/miss "
+                << ensemble_times.total_combined_cache_compute_time_avg_us
+                << " usec)" << std::endl;
+      std::cout << ident << ident << "  Average Cache Hit Latency: "
+                << ensemble_times.total_cache_hit_time_avg_us << " usec"
+                << std::endl;
+      std::cout << ident << ident << "  Average Cache Miss Latency: "
+                << ensemble_times.total_cache_miss_time_avg_us +
+                       ensemble_times.total_compute_time_avg_us
+                << " usec " << std::endl
+                << std::endl;
+    }
+    // Response Cache Disabled
+    else {
+      std::cout << " (overhead "
+                << GetOverheadDuration(
+                       cumm_avg_us, ensemble_times.total_queue_time_avg_us,
+                       ensemble_times.total_compute_time_avg_us)
+                << " usec + "
+                << "queue " << ensemble_times.total_queue_time_avg_us
+                << " usec + "
+                << "compute " << ensemble_times.total_compute_time_avg_us
+                << " usec)" << std::endl
+                << std::endl;
+    }
+
+    // List out composing models of ensemble model
     std::cout << ident << "Composing models: " << std::endl;
     for (const auto& model_stats : stats.composing_models_stat) {
       const auto& model_identifier = model_stats.first;
       std::cout << ident << model_identifier.first
                 << ", version: " << model_identifier.second << std::endl;
-      ReportServerSideStats(model_stats.second, iteration + 1);
+      ReportServerSideStats(model_stats.second, iteration + 1, parser);
     }
   }
 
@@ -222,7 +348,8 @@ cb::Error
 Report(
     const PerfStatus& summary, const int64_t percentile,
     const cb::ProtocolType protocol, const bool verbose,
-    const bool include_lib_stats, const bool include_server_stats)
+    const bool include_lib_stats, const bool include_server_stats,
+    const std::shared_ptr<ModelParser>& parser)
 {
   std::cout << "  Client: " << std::endl;
   ReportClientSideStats(
@@ -231,7 +358,7 @@ Report(
 
   if (include_server_stats) {
     std::cout << "  Server: " << std::endl;
-    ReportServerSideStats(summary.server_stats, 1);
+    ReportServerSideStats(summary.server_stats, 1, parser);
   }
 
   return cb::Error::Success;
@@ -248,13 +375,14 @@ InferenceProfiler::Create(
     std::unique_ptr<cb::ClientBackend> profile_backend,
     std::unique_ptr<LoadManager> manager,
     std::unique_ptr<InferenceProfiler>* profiler,
-    uint64_t measurement_request_count, MeasurementMode measurement_mode)
+    uint64_t measurement_request_count, MeasurementMode measurement_mode,
+    std::shared_ptr<MPIDriver> mpi_driver)
 {
   std::unique_ptr<InferenceProfiler> local_profiler(new InferenceProfiler(
       verbose, stability_threshold, measurement_window_ms, max_trials,
       (percentile != -1), percentile, latency_threshold_ms_, protocol, parser,
       std::move(profile_backend), std::move(manager), measurement_request_count,
-      measurement_mode));
+      measurement_mode, mpi_driver));
 
   *profiler = std::move(local_profiler);
   return cb::Error::Success;
@@ -268,7 +396,7 @@ InferenceProfiler::InferenceProfiler(
     std::shared_ptr<ModelParser>& parser,
     std::unique_ptr<cb::ClientBackend> profile_backend,
     std::unique_ptr<LoadManager> manager, uint64_t measurement_request_count,
-    MeasurementMode measurement_mode)
+    MeasurementMode measurement_mode, std::shared_ptr<MPIDriver> mpi_driver)
     : verbose_(verbose), measurement_window_ms_(measurement_window_ms),
       max_trials_(max_trials), extra_percentile_(extra_percentile),
       percentile_(percentile), latency_threshold_ms_(latency_threshold_ms_),
@@ -276,7 +404,7 @@ InferenceProfiler::InferenceProfiler(
       profile_backend_(std::move(profile_backend)),
       manager_(std::move(manager)),
       measurement_request_count_(measurement_request_count),
-      measurement_mode_(measurement_mode)
+      measurement_mode_(measurement_mode), mpi_driver_(mpi_driver)
 {
   load_parameters_.stability_threshold = stability_threshold;
   load_parameters_.stability_window = 3;
@@ -299,36 +427,29 @@ InferenceProfiler::InferenceProfiler(
 cb::Error
 InferenceProfiler::Profile(
     const size_t concurrent_request_count, std::vector<PerfStatus>& summary,
-    bool* meets_threshold)
+    bool& meets_threshold, bool& is_stable)
 {
   cb::Error err;
   PerfStatus status_summary;
 
   status_summary.concurrency = concurrent_request_count;
 
-  bool is_stable = false;
-  *meets_threshold = true;
+  is_stable = false;
+  meets_threshold = true;
 
   RETURN_IF_ERROR(dynamic_cast<ConcurrencyManager*>(manager_.get())
                       ->ChangeConcurrencyLevel(concurrent_request_count));
 
   err = ProfileHelper(false /* clean_starts */, status_summary, &is_stable);
   if (err.IsOk()) {
-    err = Report(
-        status_summary, percentile_, protocol_, verbose_, include_lib_stats_,
-        include_server_stats_);
     summary.push_back(status_summary);
     uint64_t stabilizing_latency_ms =
         status_summary.stabilizing_latency_ns / (1000 * 1000);
-    if (!err.IsOk()) {
-      std::cerr << err << std::endl;
-      *meets_threshold = false;
-    } else if (
-        (stabilizing_latency_ms >= latency_threshold_ms_) &&
+    if ((stabilizing_latency_ms >= latency_threshold_ms_) &&
         (latency_threshold_ms_ != NO_LIMIT)) {
       std::cerr << "Measured latency went over the set limit of "
                 << latency_threshold_ms_ << " msec. " << std::endl;
-      *meets_threshold = false;
+      meets_threshold = false;
     } else if (!is_stable) {
       if (measurement_mode_ == MeasurementMode::TIME_WINDOWS) {
         std::cerr << "Failed to obtain stable measurement within "
@@ -341,7 +462,15 @@ InferenceProfiler::Profile(
                   << concurrent_request_count << ". Please try to "
                   << "increase the --measurement-request-count." << std::endl;
       }
-      *meets_threshold = false;
+      meets_threshold = false;
+    } else {
+      err = Report(
+          status_summary, percentile_, protocol_, verbose_, include_lib_stats_,
+          include_server_stats_, parser_);
+      if (!err.IsOk()) {
+        std::cerr << err;
+        meets_threshold = false;
+      }
     }
   } else {
     return err;
@@ -353,39 +482,40 @@ InferenceProfiler::Profile(
 cb::Error
 InferenceProfiler::Profile(
     const double request_rate, std::vector<PerfStatus>& summary,
-    bool* meets_threshold)
+    bool& meets_threshold, bool& is_stable)
 {
   cb::Error err;
   PerfStatus status_summary;
 
   status_summary.request_rate = request_rate;
 
-  bool is_stable = false;
-  *meets_threshold = true;
+  is_stable = false;
+  meets_threshold = true;
 
   RETURN_IF_ERROR(dynamic_cast<RequestRateManager*>(manager_.get())
                       ->ChangeRequestRate(request_rate));
 
   err = ProfileHelper(false /*clean_starts*/, status_summary, &is_stable);
   if (err.IsOk()) {
-    err = Report(
-        status_summary, percentile_, protocol_, verbose_, include_lib_stats_,
-        include_server_stats_);
     summary.push_back(status_summary);
     uint64_t stabilizing_latency_ms =
         status_summary.stabilizing_latency_ns / (1000 * 1000);
-    if (!err.IsOk()) {
-      std::cerr << err << std::endl;
-      *meets_threshold = false;
-    } else if (
-        (stabilizing_latency_ms >= latency_threshold_ms_) &&
+    if ((stabilizing_latency_ms >= latency_threshold_ms_) &&
         (latency_threshold_ms_ != NO_LIMIT)) {
       std::cerr << "Measured latency went over the set limit of "
                 << latency_threshold_ms_ << " msec. " << std::endl;
-      *meets_threshold = false;
+      meets_threshold = false;
     } else if (!is_stable) {
       std::cerr << "Failed to obtain stable measurement." << std::endl;
-      *meets_threshold = false;
+      meets_threshold = false;
+    } else {
+      err = Report(
+          status_summary, percentile_, protocol_, verbose_, include_lib_stats_,
+          include_server_stats_, parser_);
+      if (!err.IsOk()) {
+        std::cerr << err;
+        meets_threshold = false;
+      }
     }
   } else {
     return err;
@@ -396,7 +526,7 @@ InferenceProfiler::Profile(
 
 cb::Error
 InferenceProfiler::Profile(
-    std::vector<PerfStatus>& summary, bool* meets_threshold)
+    std::vector<PerfStatus>& summary, bool& meets_threshold, bool& is_stable)
 {
   cb::Error err;
   PerfStatus status_summary;
@@ -406,29 +536,30 @@ InferenceProfiler::Profile(
   RETURN_IF_ERROR(dynamic_cast<CustomLoadManager*>(manager_.get())
                       ->GetCustomRequestRate(&status_summary.request_rate));
 
-  bool is_stable = false;
-  *meets_threshold = true;
+  is_stable = false;
+  meets_threshold = true;
 
   err = ProfileHelper(true /* clean_starts */, status_summary, &is_stable);
   if (err.IsOk()) {
-    err = Report(
-        status_summary, percentile_, protocol_, verbose_, include_lib_stats_,
-        include_server_stats_);
     summary.push_back(status_summary);
     uint64_t stabilizing_latency_ms =
         status_summary.stabilizing_latency_ns / (1000 * 1000);
-    if (!err.IsOk()) {
-      std::cerr << err << std::endl;
-      *meets_threshold = false;
-    } else if (
-        (stabilizing_latency_ms >= latency_threshold_ms_) &&
+    if ((stabilizing_latency_ms >= latency_threshold_ms_) &&
         (latency_threshold_ms_ != NO_LIMIT)) {
       std::cerr << "Measured latency went over the set limit of "
                 << latency_threshold_ms_ << " msec. " << std::endl;
-      *meets_threshold = false;
+      meets_threshold = false;
     } else if (!is_stable) {
       std::cerr << "Failed to obtain stable measurement." << std::endl;
-      *meets_threshold = false;
+      meets_threshold = false;
+    } else {
+      err = Report(
+          status_summary, percentile_, protocol_, verbose_, include_lib_stats_,
+          include_server_stats_, parser_);
+      if (!err.IsOk()) {
+        std::cerr << err;
+        meets_threshold = false;
+      }
     }
   } else {
     return err;
@@ -445,8 +576,12 @@ InferenceProfiler::ProfileHelper(
   LoadStatus load_status;
   size_t completed_trials = 0;
   std::queue<cb::Error> error;
+  std::deque<PerfStatus> perf_status;
+  all_timestamps_.clear();
+  previous_window_end_ns_ = 0;
 
   do {
+    PerfStatus status_summary;
     RETURN_IF_ERROR(manager_->CheckHealth());
 
     // Needed to obtain stable measurements
@@ -459,8 +594,11 @@ InferenceProfiler::ProfileHelper(
     } else {
       error.push(Measure(status_summary, measurement_request_count_, true));
     }
-    if (error.size() >= load_parameters_.stability_window) {
+    perf_status.push_back(status_summary);
+
+    if (error.size() > load_parameters_.stability_window) {
       error.pop();
+      perf_status.pop_front();
     }
 
     if (error.back().IsOk()) {
@@ -500,54 +638,15 @@ InferenceProfiler::ProfileHelper(
       }
     }
 
-    if (load_status.infer_per_sec.size() >= load_parameters_.stability_window) {
-      size_t idx =
-          load_status.infer_per_sec.size() - load_parameters_.stability_window;
-      if (load_status.infer_per_sec.size() >
-          load_parameters_.stability_window) {
-        load_status.avg_ips -= load_status.infer_per_sec[idx - 1] /
-                               load_parameters_.stability_window;
-        load_status.avg_latency -=
-            load_status.latencies[idx - 1] / load_parameters_.stability_window;
-      }
-      *is_stable = true;
-      bool within_threshold = false;
-      for (; idx < load_status.infer_per_sec.size(); idx++) {
-        if (load_status.infer_per_sec[idx] == 0) {
-          *is_stable = false;
-        }
-        if ((load_status.latencies[idx] <
-             (latency_threshold_ms_ * 1000 * 1000))) {
-          within_threshold = true;
-        }
-        // We call it complete only if stability_window measurements are within
-        // +/-(stability_threshold)% of the average infer per second and latency
-        if ((load_status.infer_per_sec[idx] <
-             load_status.avg_ips *
-                 (1 - load_parameters_.stability_threshold)) ||
-            (load_status.infer_per_sec[idx] >
-             load_status.avg_ips *
-                 (1 + load_parameters_.stability_threshold))) {
-          *is_stable = false;
-        }
-        if ((load_status.latencies[idx] <
-             load_status.avg_latency *
-                 (1 - load_parameters_.stability_threshold)) ||
-            (load_status.latencies[idx] >
-             load_status.avg_latency *
-                 (1 + load_parameters_.stability_threshold))) {
-          *is_stable = false;
-        }
-      }
-      if (*is_stable) {
-        break;
-      }
-      if ((!within_threshold) && (latency_threshold_ms_ != NO_LIMIT)) {
-        break;
-      }
+    *is_stable = DetermineStability(load_status);
+
+    if (IsDoneProfiling(load_status, is_stable)) {
+      break;
     }
+
     completed_trials++;
   } while ((!early_exit) && (completed_trials < max_trials_));
+
 
   // return the appropriate error which might have occured in the
   // stability_window for its proper handling.
@@ -559,9 +658,304 @@ InferenceProfiler::ProfileHelper(
     }
   }
 
-  if (early_exit) {
-    return cb::Error("Received exit signal.");
+  // Only merge the results if the results have stabilized.
+  if (*is_stable) {
+    RETURN_IF_ERROR(MergePerfStatusReports(perf_status, status_summary));
   }
+
+  if (early_exit) {
+    return cb::Error("Received exit signal.", pa::GENERIC_ERROR);
+  }
+  return cb::Error::Success;
+}
+
+bool
+InferenceProfiler::DetermineStability(LoadStatus& load_status)
+{
+  bool stable = false;
+  if (load_status.infer_per_sec.size() >= load_parameters_.stability_window) {
+    stable = true;
+    size_t idx =
+        load_status.infer_per_sec.size() - load_parameters_.stability_window;
+
+    for (size_t i = idx; i < load_status.infer_per_sec.size(); i++) {
+      if (load_status.infer_per_sec[i] == 0) {
+        stable = false;
+      }
+    }
+
+    stable = stable && CheckWindowForStability(idx, load_status);
+  }
+  return stable;
+}
+
+bool
+InferenceProfiler::CheckWindowForStability(size_t idx, LoadStatus& load_status)
+{
+  return IsInferWindowStable(idx, load_status) &&
+         IsLatencyWindowStable(idx, load_status);
+}
+
+bool
+InferenceProfiler::IsInferWindowStable(size_t idx, LoadStatus& load_status)
+{
+  auto infer_start = std::begin(load_status.infer_per_sec) + idx;
+  auto infer_per_sec_measurements = std::minmax_element(
+      infer_start, infer_start + load_parameters_.stability_window);
+
+  auto max_infer_per_sec = *infer_per_sec_measurements.second;
+  auto min_infer_per_sec = *infer_per_sec_measurements.first;
+
+  return max_infer_per_sec / min_infer_per_sec <=
+         1 + load_parameters_.stability_threshold;
+}
+
+bool
+InferenceProfiler::IsLatencyWindowStable(size_t idx, LoadStatus& load_status)
+{
+  auto latency_start = std::begin(load_status.latencies) + idx;
+  auto latencies_per_sec_measurements = std::minmax_element(
+      latency_start, latency_start + load_parameters_.stability_window);
+
+  double max_latency = *latencies_per_sec_measurements.second;
+  double min_latency = *latencies_per_sec_measurements.first;
+
+  return max_latency / min_latency <= 1 + load_parameters_.stability_threshold;
+}
+
+bool
+InferenceProfiler::IsDoneProfiling(LoadStatus& load_status, bool* is_stable)
+{
+  bool done = false;
+  bool within_threshold = true;
+  if (load_status.infer_per_sec.size() >= load_parameters_.stability_window) {
+    size_t idx =
+        load_status.infer_per_sec.size() - load_parameters_.stability_window;
+
+    for (; idx < load_status.infer_per_sec.size(); idx++) {
+      within_threshold &= CheckWithinThreshold(idx, load_status);
+    }
+  }
+
+  if (mpi_driver_->IsMPIRun()) {
+    if (AllMPIRanksAreStable(*is_stable)) {
+      done = true;
+    }
+  } else if (*is_stable) {
+    done = true;
+  }
+  if ((!within_threshold) && (latency_threshold_ms_ != NO_LIMIT)) {
+    done = true;
+  }
+  return done;
+}
+
+bool
+InferenceProfiler::CheckWithinThreshold(size_t idx, LoadStatus& load_status)
+{
+  return load_status.latencies[idx] < (latency_threshold_ms_ * 1000 * 1000);
+}
+
+cb::Error
+InferenceProfiler::MergeServerSideStats(
+    std::vector<ServerSideStats>& server_side_stats,
+    ServerSideStats& server_side_summary)
+{
+  auto& server_side_stat = server_side_stats[0];
+
+  // Make sure that the perf status reports profiling settings match with each
+  // other.
+  for (size_t i = 1; i < server_side_stats.size(); i++) {
+    if (server_side_stats[i].composing_models_stat.size() !=
+        server_side_stat.composing_models_stat.size()) {
+      return cb::Error(
+          "Inconsistent ensemble setting detected between the trials.",
+          pa::GENERIC_ERROR);
+    }
+  }
+
+  // Initialize the server stats for the merged report.
+  server_side_summary.inference_count = 0;
+  server_side_summary.execution_count = 0;
+  server_side_summary.cache_hit_count = 0;
+  server_side_summary.cache_miss_count = 0;
+  server_side_summary.success_count = 0;
+  server_side_summary.queue_count = 0;
+  server_side_summary.compute_input_count = 0;
+  server_side_summary.compute_output_count = 0;
+  server_side_summary.compute_infer_count = 0;
+  server_side_summary.cumm_time_ns = 0;
+  server_side_summary.queue_time_ns = 0;
+  server_side_summary.compute_input_time_ns = 0;
+  server_side_summary.compute_infer_time_ns = 0;
+  server_side_summary.compute_output_time_ns = 0;
+  server_side_summary.cache_hit_time_ns = 0;
+  server_side_summary.cache_miss_time_ns = 0;
+  server_side_summary.composing_models_stat.clear();
+  for (auto& composing_model_stat : server_side_stat.composing_models_stat) {
+    std::vector<ServerSideStats> composing_model_stats;
+    for (auto& server_side_stat : server_side_stats) {
+      composing_model_stats.push_back(
+          server_side_stat.composing_models_stat[composing_model_stat.first]);
+    }
+
+    ServerSideStats merged_composing_model_stats;
+    RETURN_IF_ERROR(MergeServerSideStats(
+        composing_model_stats, merged_composing_model_stats));
+    server_side_summary.composing_models_stat.insert(
+        {composing_model_stat.first, merged_composing_model_stats});
+  }
+
+  for (auto& server_side_stat : server_side_stats) {
+    // Aggregated Server Stats
+    server_side_summary.inference_count += server_side_stat.inference_count;
+    server_side_summary.execution_count += server_side_stat.execution_count;
+    server_side_summary.cache_hit_count += server_side_stat.cache_hit_count;
+    server_side_summary.cache_miss_count += server_side_stat.cache_miss_count;
+    server_side_summary.success_count += server_side_stat.success_count;
+    server_side_summary.queue_count += server_side_stat.queue_count;
+    server_side_summary.compute_input_count +=
+        server_side_stat.compute_input_count;
+    server_side_summary.compute_infer_count +=
+        server_side_stat.compute_infer_count;
+    server_side_summary.compute_output_count +=
+        server_side_stat.compute_output_count;
+    server_side_summary.cumm_time_ns += server_side_stat.cumm_time_ns;
+    server_side_summary.queue_time_ns += server_side_stat.queue_time_ns;
+    server_side_summary.compute_input_time_ns +=
+        server_side_stat.compute_input_time_ns;
+    server_side_summary.compute_infer_time_ns +=
+        server_side_stat.compute_infer_time_ns;
+    server_side_summary.compute_output_time_ns +=
+        server_side_stat.compute_output_time_ns;
+    server_side_summary.cache_hit_time_ns += server_side_stat.cache_hit_time_ns;
+    server_side_summary.cache_miss_time_ns +=
+        server_side_stat.cache_miss_time_ns;
+  }
+
+  return cb::Error::Success;
+}
+
+cb::Error
+InferenceProfiler::MergePerfStatusReports(
+    std::deque<PerfStatus>& perf_status_reports, PerfStatus& summary_status)
+{
+  auto& perf_status = perf_status_reports[0];
+
+  // Make sure that the perf status reports profiling settings match with each
+  // other.
+  for (size_t i = 1; i < perf_status_reports.size(); i++) {
+    perf_status.concurrency = summary_status.concurrency;
+    perf_status.request_rate = summary_status.request_rate;
+
+    if (perf_status_reports[i].on_sequence_model !=
+        perf_status.on_sequence_model) {
+      return cb::Error(
+          "Incosistent sequence setting detected.", pa::GENERIC_ERROR);
+    }
+
+    if (perf_status_reports[i].batch_size != perf_status.batch_size) {
+      return cb::Error("Incosistent batch size detected.", pa::GENERIC_ERROR);
+    }
+
+    if (perf_status_reports[i].server_stats.composing_models_stat.size() !=
+        perf_status.server_stats.composing_models_stat.size()) {
+      return cb::Error(
+          "Inconsistent ensemble setting detected between the trials.",
+          pa::GENERIC_ERROR);
+    }
+  }
+
+  summary_status.batch_size = perf_status.batch_size;
+  summary_status.on_sequence_model = perf_status.on_sequence_model;
+
+  // Initialize the client stats for the merged report.
+  summary_status.client_stats.request_count = 0;
+  summary_status.client_stats.sequence_count = 0;
+  summary_status.client_stats.delayed_request_count = 0;
+  summary_status.client_stats.duration_ns = 0;
+  summary_status.client_stats.avg_latency_ns = 0;
+  summary_status.client_stats.percentile_latency_ns.clear();
+  summary_status.client_stats.latencies.clear();
+  summary_status.client_stats.std_us = 0;
+  summary_status.client_stats.avg_request_time_ns = 0;
+  summary_status.client_stats.avg_send_time_ns = 0;
+  summary_status.client_stats.avg_receive_time_ns = 0;
+  summary_status.client_stats.infer_per_sec = 0;
+  summary_status.client_stats.sequence_per_sec = 0;
+  summary_status.client_stats.completed_count = 0;
+  summary_status.stabilizing_latency_ns = 0;
+
+  std::vector<ServerSideStats> server_side_stats;
+  for (auto& perf_status : perf_status_reports) {
+    // Aggregated Client Stats
+    summary_status.client_stats.request_count +=
+        perf_status.client_stats.request_count;
+    summary_status.client_stats.sequence_count +=
+        perf_status.client_stats.sequence_count;
+    summary_status.client_stats.delayed_request_count +=
+        perf_status.client_stats.delayed_request_count;
+    summary_status.client_stats.duration_ns +=
+        perf_status.client_stats.duration_ns;
+
+    server_side_stats.push_back(perf_status.server_stats);
+
+    summary_status.client_stats.latencies.insert(
+        summary_status.client_stats.latencies.end(),
+        perf_status.client_stats.latencies.begin(),
+        perf_status.client_stats.latencies.end());
+  }
+
+  if (include_lib_stats_) {
+    for (auto& perf_status : perf_status_reports) {
+      summary_status.client_stats.completed_count +=
+          perf_status.client_stats.completed_count;
+
+      summary_status.client_stats.avg_request_time_ns +=
+          perf_status.client_stats.avg_request_time_ns *
+          perf_status.client_stats.completed_count;
+
+      summary_status.client_stats.avg_send_time_ns +=
+          perf_status.client_stats.avg_send_time_ns *
+          perf_status.client_stats.completed_count;
+
+      summary_status.client_stats.avg_receive_time_ns +=
+          perf_status.client_stats.avg_receive_time_ns *
+          perf_status.client_stats.completed_count;
+    }
+
+    if (summary_status.client_stats.completed_count != 0) {
+      summary_status.client_stats.avg_request_time_ns =
+          summary_status.client_stats.avg_request_time_ns /
+          summary_status.client_stats.completed_count;
+
+      summary_status.client_stats.avg_send_time_ns =
+          summary_status.client_stats.avg_send_time_ns /
+          summary_status.client_stats.completed_count;
+
+      summary_status.client_stats.avg_receive_time_ns =
+          summary_status.client_stats.avg_receive_time_ns /
+          summary_status.client_stats.completed_count;
+    }
+  }
+
+  RETURN_IF_ERROR(
+      MergeServerSideStats(server_side_stats, summary_status.server_stats));
+
+  std::sort(
+      summary_status.client_stats.latencies.begin(),
+      summary_status.client_stats.latencies.end());
+
+  float client_duration_sec =
+      (float)summary_status.client_stats.duration_ns / NANOS_PER_SECOND;
+  summary_status.client_stats.sequence_per_sec =
+      summary_status.client_stats.sequence_count / client_duration_sec;
+  summary_status.client_stats.infer_per_sec =
+      (summary_status.client_stats.request_count * summary_status.batch_size) /
+      client_duration_sec;
+  RETURN_IF_ERROR(
+      SummarizeLatency(summary_status.client_stats.latencies, summary_status));
+
   return cb::Error::Success;
 }
 
@@ -589,22 +983,28 @@ InferenceProfiler::Measure(
   std::map<cb::ModelIdentifier, cb::ModelStatistics> end_status;
   cb::InferStat start_stat;
   cb::InferStat end_stat;
-  long long measurement_window_ms;
 
-  if (include_server_stats_) {
-    RETURN_IF_ERROR(GetServerSideStatus(&start_status));
+  // Set current window start time to end of previous window. For first
+  // measurement window, capture start time, server side stats, and client side
+  // stats.
+  uint64_t window_start_ns = previous_window_end_ns_;
+  start_stat = prev_client_side_stats_;
+  start_status = prev_server_side_stats_;
+  if (window_start_ns == 0) {
+    window_start_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                          std::chrono::system_clock::now().time_since_epoch())
+                          .count();
+    if (include_server_stats_) {
+      RETURN_IF_ERROR(GetServerSideStatus(&start_status));
+    }
+    RETURN_IF_ERROR(manager_->GetAccumulatedClientStat(&start_stat));
   }
-  RETURN_IF_ERROR(manager_->GetAccumulatedClientStat(&start_stat));
 
   if (!is_count_based) {
     // Wait for specified time interval in msec
     std::this_thread::sleep_for(
         std::chrono::milliseconds((uint64_t)(measurement_window_ms_ * 1.2)));
-    measurement_window_ms = measurement_window_ms_;
   } else {
-    std::chrono::milliseconds measurement_window_start =
-        std::chrono::duration_cast<std::chrono::milliseconds>(
-            std::chrono::system_clock::now().time_since_epoch());
     do {
       // Check the health of the worker threads.
       RETURN_IF_ERROR(manager_->CheckHealth());
@@ -612,55 +1012,58 @@ InferenceProfiler::Measure(
       // Wait for 1s until enough samples have been collected.
       std::this_thread::sleep_for(std::chrono::milliseconds((uint64_t)1000));
     } while (manager_->CountCollectedRequests() < measurement_window);
-
-    std::chrono::milliseconds measurement_window_end =
-        std::chrono::duration_cast<std::chrono::milliseconds>(
-            std::chrono::system_clock::now().time_since_epoch());
-    measurement_window_ms =
-        (measurement_window_end - measurement_window_start).count();
   }
 
-  RETURN_IF_ERROR(manager_->GetAccumulatedClientStat(&end_stat));
+  uint64_t window_end_ns =
+      std::chrono::duration_cast<std::chrono::nanoseconds>(
+          std::chrono::system_clock::now().time_since_epoch())
+          .count();
+  previous_window_end_ns_ = window_end_ns;
 
   // Get server status and then print report on difference between
   // before and after status.
   if (include_server_stats_) {
     RETURN_IF_ERROR(GetServerSideStatus(&end_status));
+    prev_server_side_stats_ = end_status;
   }
+
+  RETURN_IF_ERROR(manager_->GetAccumulatedClientStat(&end_stat));
+  prev_client_side_stats_ = end_stat;
 
   TimestampVector current_timestamps;
   RETURN_IF_ERROR(manager_->SwapTimestamps(current_timestamps));
+  all_timestamps_.insert(
+      all_timestamps_.end(), current_timestamps.begin(),
+      current_timestamps.end());
 
   RETURN_IF_ERROR(Summarize(
-      current_timestamps, start_status, end_status, start_stat, end_stat,
-      status_summary, measurement_window_ms));
+      start_status, end_status, start_stat, end_stat, status_summary,
+      window_start_ns, window_end_ns));
 
   return cb::Error::Success;
 }
 
 cb::Error
 InferenceProfiler::Summarize(
-    const TimestampVector& timestamps,
     const std::map<cb::ModelIdentifier, cb::ModelStatistics>& start_status,
     const std::map<cb::ModelIdentifier, cb::ModelStatistics>& end_status,
     const cb::InferStat& start_stat, const cb::InferStat& end_stat,
-    PerfStatus& summary, long long measurement_window_ms)
+    PerfStatus& summary, uint64_t window_start_ns, uint64_t window_end_ns)
 {
   size_t valid_sequence_count = 0;
   size_t delayed_request_count = 0;
 
   // Get measurement from requests that fall within the time interval
-  std::pair<uint64_t, uint64_t> valid_range;
-  MeasurementTimestamp(timestamps, &valid_range, measurement_window_ms);
+  std::pair<uint64_t, uint64_t> valid_range{window_start_ns, window_end_ns};
   std::vector<uint64_t> latencies;
   ValidLatencyMeasurement(
-      timestamps, valid_range, valid_sequence_count, delayed_request_count,
-      &latencies);
+      valid_range, valid_sequence_count, delayed_request_count, &latencies);
 
   RETURN_IF_ERROR(SummarizeLatency(latencies, summary));
   RETURN_IF_ERROR(SummarizeClientStat(
       start_stat, end_stat, valid_range.second - valid_range.first,
       latencies.size(), valid_sequence_count, delayed_request_count, summary));
+  summary.client_stats.latencies = std::move(latencies);
 
   if (include_server_stats_) {
     RETURN_IF_ERROR(SummarizeServerStats(
@@ -671,58 +1074,25 @@ InferenceProfiler::Summarize(
 }
 
 void
-InferenceProfiler::MeasurementTimestamp(
-    const TimestampVector& timestamps,
-    std::pair<uint64_t, uint64_t>* valid_range, long long measurement_window_ms)
-{
-  // finding the start time of the first request
-  // and the end time of the last request in the timestamp queue
-  uint64_t first_request_start_ns = 0;
-  uint64_t last_request_end_ns = 0;
-  for (auto& timestamp : timestamps) {
-    uint64_t request_start_time = TIMESPEC_TO_NANOS(std::get<0>(timestamp));
-    uint64_t request_end_time = TIMESPEC_TO_NANOS(std::get<1>(timestamp));
-    if ((first_request_start_ns > request_start_time) ||
-        (first_request_start_ns == 0)) {
-      first_request_start_ns = request_start_time;
-    }
-    if ((last_request_end_ns < request_end_time) ||
-        (last_request_end_ns == 0)) {
-      last_request_end_ns = request_end_time;
-    }
-  }
-
-  // Define the measurement window [client_start_ns, client_end_ns) to be
-  // in the middle of the queue
-  uint64_t measurement_window_ns = measurement_window_ms * 1000 * 1000;
-  uint64_t offset = first_request_start_ns + measurement_window_ns;
-  offset =
-      (offset > last_request_end_ns) ? 0 : (last_request_end_ns - offset) / 2;
-
-  uint64_t start_ns = first_request_start_ns + offset;
-  uint64_t end_ns = start_ns + measurement_window_ns;
-
-  *valid_range = std::make_pair(start_ns, end_ns);
-}
-
-void
 InferenceProfiler::ValidLatencyMeasurement(
-    const TimestampVector& timestamps,
     const std::pair<uint64_t, uint64_t>& valid_range,
     size_t& valid_sequence_count, size_t& delayed_request_count,
     std::vector<uint64_t>* valid_latencies)
 {
   valid_latencies->clear();
   valid_sequence_count = 0;
-  for (auto& timestamp : timestamps) {
-    uint64_t request_start_ns = TIMESPEC_TO_NANOS(std::get<0>(timestamp));
-    uint64_t request_end_ns = TIMESPEC_TO_NANOS(std::get<1>(timestamp));
+  std::vector<size_t> erase_indices{};
+  for (size_t i = 0; i < all_timestamps_.size(); i++) {
+    const auto& timestamp = all_timestamps_[i];
+    uint64_t request_start_ns = CHRONO_TO_NANOS(std::get<0>(timestamp));
+    uint64_t request_end_ns = CHRONO_TO_NANOS(std::get<1>(timestamp));
 
     if (request_start_ns <= request_end_ns) {
       // Only counting requests that end within the time interval
       if ((request_end_ns >= valid_range.first) &&
           (request_end_ns <= valid_range.second)) {
         valid_latencies->push_back(request_end_ns - request_start_ns);
+        erase_indices.push_back(i);
         // Just add the sequence_end flag here.
         if (std::get<2>(timestamp)) {
           valid_sequence_count++;
@@ -733,6 +1103,13 @@ InferenceProfiler::ValidLatencyMeasurement(
       }
     }
   }
+
+  // Iterate through erase indices backwards so that erases from
+  // `all_timestamps_` happen from the back to the front to avoid using wrong
+  // indices after subsequent erases
+  std::for_each(erase_indices.rbegin(), erase_indices.rend(), [this](size_t i) {
+    this->all_timestamps_.erase(this->all_timestamps_.begin() + i);
+  });
 
   // Always sort measured latencies as percentile will be reported as default
   std::sort(valid_latencies->begin(), valid_latencies->end());
@@ -745,18 +1122,12 @@ InferenceProfiler::SummarizeLatency(
   if (latencies.size() == 0) {
     return cb::Error(
         "No valid requests recorded within time interval."
-        " Please use a larger time window.");
+        " Please use a larger time window.",
+        pa::OPTION_ERROR);
   }
 
-  uint64_t tol_latency_ns = 0;
-  uint64_t tol_square_latency_us = 0;
-
-  for (const auto& latency : latencies) {
-    tol_latency_ns += latency;
-    tol_square_latency_us += (latency * latency) / (1000 * 1000);
-  }
-
-  summary.client_stats.avg_latency_ns = tol_latency_ns / latencies.size();
+  std::tie(summary.client_stats.avg_latency_ns, summary.client_stats.std_us) =
+      GetMeanAndStdDev(latencies);
 
   // retrieve other interesting percentile
   summary.client_stats.percentile_latency_ns.clear();
@@ -778,18 +1149,40 @@ InferenceProfiler::SummarizeLatency(
     summary.stabilizing_latency_ns = summary.client_stats.avg_latency_ns;
   }
 
-  // calculate standard deviation
-  uint64_t expected_square_latency_us =
-      tol_square_latency_us / latencies.size();
-  uint64_t square_avg_latency_us = (summary.client_stats.avg_latency_ns *
-                                    summary.client_stats.avg_latency_ns) /
-                                   (1000 * 1000);
-  uint64_t var_us = (expected_square_latency_us > square_avg_latency_us)
-                        ? (expected_square_latency_us - square_avg_latency_us)
-                        : 0;
-  summary.client_stats.std_us = (uint64_t)(sqrt(var_us));
-
   return cb::Error::Success;
+}
+
+std::tuple<uint64_t, uint64_t>
+InferenceProfiler::GetMeanAndStdDev(const std::vector<uint64_t>& latencies)
+{
+  uint64_t avg_latency_ns{0};
+  uint64_t std_dev_latency_us{0};
+
+  // calculate mean of latencies
+  uint64_t tol_latency_ns{
+      std::accumulate(latencies.begin(), latencies.end(), 0ULL)};
+  avg_latency_ns = tol_latency_ns / latencies.size();
+
+  // calculate sample standard deviation of latencies
+  uint64_t sq_sum_latency_avg_diff_ns{0};
+  std::for_each(
+      latencies.begin(), latencies.end(),
+      [avg_latency_ns, &sq_sum_latency_avg_diff_ns](uint64_t l) {
+        sq_sum_latency_avg_diff_ns += static_cast<int64_t>(l - avg_latency_ns) *
+                                      static_cast<int64_t>(l - avg_latency_ns);
+      });
+  if (latencies.size() > 1) {
+    std_dev_latency_us =
+        std::sqrt(sq_sum_latency_avg_diff_ns / (latencies.size() - 1)) / 1000;
+  } else {
+    std_dev_latency_us = UINT64_MAX;
+    std::cerr << "WARNING: Pass contained only one request, so sample latency "
+                 "standard deviation will be infinity (UINT64_MAX)."
+              << std::endl;
+  }
+
+
+  return std::make_tuple(avg_latency_ns, std_dev_latency_us);
 }
 
 cb::Error
@@ -819,6 +1212,7 @@ InferenceProfiler::SummarizeClientStat(
         end_stat.completed_request_count - start_stat.completed_request_count;
     uint64_t request_time_ns = end_stat.cumulative_total_request_time_ns -
                                start_stat.cumulative_total_request_time_ns;
+    summary.client_stats.completed_count = completed_count;
     uint64_t send_time_ns =
         end_stat.cumulative_send_time_ns - start_stat.cumulative_send_time_ns;
     uint64_t receive_time_ns = end_stat.cumulative_receive_time_ns -
@@ -842,8 +1236,8 @@ InferenceProfiler::SummarizeServerStatsHelper(
     const std::map<cb::ModelIdentifier, cb::ModelStatistics>& end_status,
     ServerSideStats* server_stats)
 {
-  // If model_version is an empty string then look in the end status to find the
-  // latest (highest valued version) and use that as the version.
+  // If model_version is an empty string then look in the end status to find
+  // the latest (highest valued version) and use that as the version.
   int64_t status_model_version = -1;
   if (model_identifier.second.empty()) {
     for (const auto& id : end_status) {
@@ -858,7 +1252,8 @@ InferenceProfiler::SummarizeServerStatsHelper(
   }
 
   if (status_model_version == -1) {
-    return cb::Error("failed to determine the requested model version");
+    return cb::Error(
+        "failed to determine the requested model version", pa::GENERIC_ERROR);
   }
 
   const std::pair<std::string, std::string> this_id(
@@ -866,27 +1261,44 @@ InferenceProfiler::SummarizeServerStatsHelper(
 
   const auto& end_itr = end_status.find(this_id);
   if (end_itr == end_status.end()) {
-    return cb::Error("missing statistics for requested model");
+    return cb::Error(
+        "missing statistics for requested model", pa::GENERIC_ERROR);
   } else {
     uint64_t start_infer_cnt = 0;
     uint64_t start_exec_cnt = 0;
     uint64_t start_cnt = 0;
+    uint64_t start_queue_cnt = 0;
+    uint64_t start_compute_input_cnt = 0;
+    uint64_t start_compute_infer_cnt = 0;
+    uint64_t start_compute_output_cnt = 0;
     uint64_t start_cumm_time_ns = 0;
     uint64_t start_queue_time_ns = 0;
     uint64_t start_compute_input_time_ns = 0;
     uint64_t start_compute_infer_time_ns = 0;
     uint64_t start_compute_output_time_ns = 0;
+    uint64_t start_cache_hit_cnt = 0;
+    uint64_t start_cache_hit_time_ns = 0;
+    uint64_t start_cache_miss_cnt = 0;
+    uint64_t start_cache_miss_time_ns = 0;
 
     const auto& start_itr = start_status.find(this_id);
     if (start_itr != start_status.end()) {
       start_infer_cnt = start_itr->second.inference_count_;
       start_exec_cnt = start_itr->second.execution_count_;
       start_cnt = start_itr->second.success_count_;
+      start_queue_cnt = start_itr->second.queue_count_;
+      start_compute_input_cnt = start_itr->second.compute_input_count_;
+      start_compute_infer_cnt = start_itr->second.compute_infer_count_;
+      start_compute_output_cnt = start_itr->second.compute_output_count_;
       start_cumm_time_ns = start_itr->second.cumm_time_ns_;
       start_queue_time_ns = start_itr->second.queue_time_ns_;
       start_compute_input_time_ns = start_itr->second.compute_input_time_ns_;
       start_compute_infer_time_ns = start_itr->second.compute_infer_time_ns_;
       start_compute_output_time_ns = start_itr->second.compute_output_time_ns_;
+      start_cache_hit_cnt = start_itr->second.cache_hit_count_;
+      start_cache_hit_time_ns = start_itr->second.cache_hit_time_ns_;
+      start_cache_miss_cnt = start_itr->second.cache_miss_count_;
+      start_cache_miss_time_ns = start_itr->second.cache_miss_time_ns_;
     }
 
     server_stats->inference_count =
@@ -894,6 +1306,13 @@ InferenceProfiler::SummarizeServerStatsHelper(
     server_stats->execution_count =
         end_itr->second.execution_count_ - start_exec_cnt;
     server_stats->success_count = end_itr->second.success_count_ - start_cnt;
+    server_stats->queue_count = end_itr->second.queue_count_ - start_queue_cnt;
+    server_stats->compute_input_count =
+        end_itr->second.compute_input_count_ - start_compute_input_cnt;
+    server_stats->compute_infer_count =
+        end_itr->second.compute_infer_count_ - start_compute_infer_cnt;
+    server_stats->compute_output_count =
+        end_itr->second.compute_output_count_ - start_compute_output_cnt;
     server_stats->cumm_time_ns =
         end_itr->second.cumm_time_ns_ - start_cumm_time_ns;
     server_stats->queue_time_ns =
@@ -904,6 +1323,14 @@ InferenceProfiler::SummarizeServerStatsHelper(
         end_itr->second.compute_infer_time_ns_ - start_compute_infer_time_ns;
     server_stats->compute_output_time_ns =
         end_itr->second.compute_output_time_ns_ - start_compute_output_time_ns;
+    server_stats->cache_hit_count =
+        end_itr->second.cache_hit_count_ - start_cache_hit_cnt;
+    server_stats->cache_hit_time_ns =
+        end_itr->second.cache_hit_time_ns_ - start_cache_hit_time_ns;
+    server_stats->cache_miss_count =
+        end_itr->second.cache_miss_count_ - start_cache_miss_cnt;
+    server_stats->cache_miss_time_ns =
+        end_itr->second.cache_miss_time_ns_ - start_cache_miss_time_ns;
   }
 
   return cb::Error::Success;
@@ -944,4 +1371,31 @@ InferenceProfiler::SummarizeServerStats(
   return cb::Error::Success;
 }
 
+bool
+InferenceProfiler::AllMPIRanksAreStable(bool current_rank_stability)
+{
+  int world_size{mpi_driver_->MPICommSizeWorld()};
+  std::vector<int> stabilities_per_rank{};
+  stabilities_per_rank.resize(world_size, 0);
+  int my_rank{mpi_driver_->MPICommRankWorld()};
+  stabilities_per_rank[my_rank] = static_cast<int>(current_rank_stability);
+
+  for (int rank{0}; rank < world_size; rank++) {
+    mpi_driver_->MPIBcastIntWorld(stabilities_per_rank.data() + rank, 1, rank);
+  }
+
+  bool all_stable{true};
+  for (int rank{0}; rank < world_size; rank++) {
+    if (stabilities_per_rank[rank] == 0) {
+      all_stable = false;
+      break;
+    }
+  }
+
+  if (verbose_ && all_stable) {
+    std::cout << "All models on all MPI ranks are stable" << std::endl;
+  }
+
+  return all_stable;
+}
 }}  // namespace triton::perfanalyzer

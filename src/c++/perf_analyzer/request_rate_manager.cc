@@ -1,4 +1,4 @@
-// Copyright (c) 2020, NVIDIA CORPORATION. All rights reserved.
+// Copyright 2020-2022, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 //
 // Redistribution and use in source and binary forms, with or without
 // modification, are permitted provided that the following conditions
@@ -219,8 +219,8 @@ RequestRateManager::Infer(
       std::lock_guard<std::mutex> lock(thread_stat->mu_);
       thread_stat->cb_status_ = result_ptr->RequestStatus();
       if (thread_stat->cb_status_.IsOk()) {
-        struct timespec end_time_async;
-        clock_gettime(CLOCK_MONOTONIC, &end_time_async);
+        std::chrono::time_point<std::chrono::system_clock> end_time_async;
+        end_time_async = std::chrono::system_clock::now();
         std::string request_id;
         thread_stat->cb_status_ = result_ptr->Id(&request_id);
         const auto& it = async_req_map->find(request_id);
@@ -293,7 +293,8 @@ RequestRateManager::Infer(
                      data_loader_->GetTotalStepsNonSequence()) *
                     batch_size_;
       thread_config->non_sequence_data_step_id_ += max_threads_;
-      thread_stat->status_ = UpdateInputs(ctx->inputs_, 0, step_id);
+      thread_stat->status_ =
+          UpdateInputs(ctx->inputs_, ctx->valid_inputs_, 0, step_id);
       if (thread_stat->status_.IsOk()) {
         thread_stat->status_ = UpdateValidationOutputs(
             ctx->outputs_, 0, step_id, ctx->expected_outputs_);
@@ -318,7 +319,8 @@ RequestRateManager::Infer(
                             sequence_stat_[seq_id]->data_stream_id_) -
                         sequence_stat_[seq_id]->remaining_queries_;
           thread_stat->status_ = UpdateInputs(
-              ctx->inputs_, sequence_stat_[seq_id]->data_stream_id_, step_id);
+              ctx->inputs_, ctx->valid_inputs_,
+              sequence_stat_[seq_id]->data_stream_id_, step_id);
           if (thread_stat->status_.IsOk()) {
             thread_stat->status_ = UpdateValidationOutputs(
                 ctx->outputs_, sequence_stat_[seq_id]->data_stream_id_, step_id,
@@ -386,16 +388,16 @@ RequestRateManager::Request(
               ->emplace(
                   context->options_->request_id_, AsyncRequestProperties())
               .first;
-      clock_gettime(CLOCK_MONOTONIC, &(it->second.start_time_));
+      it->second.start_time_ = std::chrono::system_clock::now();
       it->second.sequence_end_ = context->options_->sequence_end_;
       it->second.delayed_ = delayed;
     }
     if (streaming_) {
       thread_stat->status_ = context->infer_backend_->AsyncStreamInfer(
-          *(context->options_), context->inputs_, context->outputs_);
+          *(context->options_), context->valid_inputs_, context->outputs_);
     } else {
       thread_stat->status_ = context->infer_backend_->AsyncInfer(
-          callback_func, *(context->options_), context->inputs_,
+          callback_func, *(context->options_), context->valid_inputs_,
           context->outputs_);
     }
     if (!thread_stat->status_.IsOk()) {
@@ -403,11 +405,13 @@ RequestRateManager::Request(
     }
     context->inflight_request_cnt_++;
   } else {
-    struct timespec start_time_sync, end_time_sync;
-    clock_gettime(CLOCK_MONOTONIC, &start_time_sync);
+    std::chrono::time_point<std::chrono::system_clock> start_time_sync,
+        end_time_sync;
+    start_time_sync = std::chrono::system_clock::now();
     cb::InferResult* results = nullptr;
     thread_stat->status_ = context->infer_backend_->Infer(
-        &results, *(context->options_), context->inputs_, context->outputs_);
+        &results, *(context->options_), context->valid_inputs_,
+        context->outputs_);
     if (results != nullptr) {
       if (thread_stat->status_.IsOk()) {
         thread_stat->status_ = ValidateOutputs(*context, results);
@@ -417,7 +421,7 @@ RequestRateManager::Request(
     if (!thread_stat->status_.IsOk()) {
       return;
     }
-    clock_gettime(CLOCK_MONOTONIC, &end_time_sync);
+    end_time_sync = std::chrono::system_clock::now();
     {
       // Add the request timestamp to thread Timestamp vector with proper
       // locking
