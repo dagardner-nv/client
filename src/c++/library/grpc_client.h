@@ -25,10 +25,10 @@
 // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #pragma once
 
-/// \file
-
 #include <grpcpp/grpcpp.h>
+
 #include <queue>
+
 #include "common.h"
 #include "grpc_service.grpc.pb.h"
 #include "ipc.h"
@@ -154,15 +154,25 @@ class InferenceServerGrpcClient : public InferenceServerClient {
   /// \param live Returns whether the server is live or not.
   /// \param headers Optional map specifying additional HTTP headers to include
   /// in the metadata of gRPC request.
-  /// \return Error object indicating success or failure of the request.
-  Error IsServerLive(bool* live, const Headers& headers = Headers());
+  /// \param timeout_ms Optional timeout for API call, in microseconds, the
+  /// request is allowed to take.
+  /// \return Error object indicating success or
+  /// failure of the request.
+  Error IsServerLive(
+      bool* live, const Headers& headers = Headers(),
+      const uint64_t timeout_ms = 0);
 
   /// Contact the inference server and get its readiness.
   /// \param ready Returns whether the server is ready or not.
   /// \param headers Optional map specifying additional HTTP headers to include
   /// in the metadata of gRPC request.
-  /// \return Error object indicating success or failure of the request.
-  Error IsServerReady(bool* ready, const Headers& headers = Headers());
+  /// \param timeout_ms Optional timeout for API call, in microseconds, the
+  /// request is allowed to take.
+  /// \return Error object indicating success or
+  /// failure of the request.
+  Error IsServerReady(
+      bool* ready, const Headers& headers = Headers(),
+      const uint64_t timeout_ms = 0);
 
   /// Contact the inference server and get the readiness of specified model.
   /// \param ready Returns whether the specified model is ready or not.
@@ -172,21 +182,27 @@ class InferenceServerGrpcClient : public InferenceServerClient {
   /// choose a version based on the model and internal policy.
   /// \param headers Optional map specifying additional HTTP headers to include
   /// in the metadata of gRPC request.
-  /// \return Error object indicating success or failure of the request.
+  /// \param timeout_ms Optional timeout for API call, in microseconds, the
+  /// request is allowed to take.
+  /// \return Error object indicating success or
+  /// failure of the request.
   Error IsModelReady(
       bool* ready, const std::string& model_name,
-      const std::string& model_version = "",
-      const Headers& headers = Headers());
+      const std::string& model_version = "", const Headers& headers = Headers(),
+      const uint64_t timeout_ms = 0);
 
   /// Contact the inference server and get its metadata.
   /// \param server_metadata Returns the server metadata as
   /// SeverMetadataResponse message.
   /// \param headers Optional map specifying additional HTTP headers to include
   /// in the metadata of gRPC request.
-  /// \return Error object indicating success or failure of the request.
+  /// \param timeout_ms Optional timeout for API call, in microseconds, the
+  /// request is allowed to take.
+  /// \return Error object indicating success or
+  /// failure of the request.
   Error ServerMetadata(
       inference::ServerMetadataResponse* server_metadata,
-      const Headers& headers = Headers());
+      const Headers& headers = Headers(), const uint64_t timeout_ms = 0);
 
   /// Contact the inference server and get the metadata of specified model.
   /// \param model_metadata Returns model metadata as ModelMetadataResponse
@@ -197,11 +213,14 @@ class InferenceServerGrpcClient : public InferenceServerClient {
   /// choose a version based on the model and internal policy.
   /// \param headers Optional map specifying additional HTTP headers to include
   /// in the metadata of gRPC request.
-  /// \return Error object indicating success or failure of the request.
+  /// \param timeout_ms Optional timeout for API call, in microseconds, the
+  /// request is allowed to take.
+  /// \return Error object indicating success or
+  /// failure of the request.
   Error ModelMetadata(
       inference::ModelMetadataResponse* model_metadata,
       const std::string& model_name, const std::string& model_version = "",
-      const Headers& headers = Headers());
+      const Headers& headers = Headers(), const uint64_t timeout_ms = 0);
 
   /// Contact the inference server and get the configuration of specified model.
   /// \param model_config Returns model config as ModelConfigResponse
@@ -212,11 +231,14 @@ class InferenceServerGrpcClient : public InferenceServerClient {
   /// choose a version based on the model and internal policy.
   /// \param headers Optional map specifying additional HTTP headers to include
   /// in the metadata of gRPC request.
-  /// \return Error object indicating success or failure of the request.
+  /// \param timeout_ms Optional timeout for API call, in microseconds, the
+  /// request is allowed to take.
+  /// \return Error object indicating success or
+  /// failure of the request.
   Error ModelConfig(
       inference::ModelConfigResponse* model_config,
       const std::string& model_name, const std::string& model_version = "",
-      const Headers& headers = Headers());
+      const Headers& headers = Headers(), const uint64_t timeout_ms = 0);
 
   /// Contact the inference server and get the index of model repository
   /// contents.
@@ -224,10 +246,13 @@ class InferenceServerGrpcClient : public InferenceServerClient {
   /// RepositoryIndexRequestResponse
   /// \param headers Optional map specifying additional HTTP headers to include
   /// in the metadata of gRPC request.
-  /// \return Error object indicating success or failure of the request.
+  /// \param timeout_ms Optional timeout for API call, in microseconds, the
+  /// request is allowed to take.
+  /// \return Error object indicating success or
+  /// failure of the request.
   Error ModelRepositoryIndex(
       inference::RepositoryIndexResponse* repository_index,
-      const Headers& headers = Headers());
+      const Headers& headers = Headers(), const uint64_t timeout_ms = 0);
 
   /// Request the inference server to load or reload specified model.
   /// \param model_name The name of the model to be loaded or reloaded.
@@ -241,19 +266,27 @@ class InferenceServerGrpcClient : public InferenceServerClient {
   /// The files will form the model directory that the model
   /// will be loaded from. If specified, 'config' must be provided to be
   /// the model configuration of the override model directory.
-  /// \return Error object indicating success or failure of the request.
+  /// \param timeout_ms Optional timeout for API call, in microseconds, the
+  /// request is allowed to take.
+  /// \return Error object indicating success or
+  /// failure of the request.
   Error LoadModel(
       const std::string& model_name, const Headers& headers = Headers(),
       const std::string& config = std::string(),
-      const std::map<std::string, std::vector<char>>& files = {});
+      const std::map<std::string, std::vector<char>>& files = {},
+      const uint64_t timeout_ms = 0);
 
   /// Request the inference server to unload specified model.
   /// \param model_name The name of the model to be unloaded.
   /// \param headers Optional map specifying additional HTTP headers to include
   /// in the metadata of gRPC request.
-  /// \return Error object indicating success or failure of the request.
+  /// \param timeout_ms Optional timeout for API call, in microseconds, the
+  /// request is allowed to take.
+  /// \return Error object indicating success or
+  /// failure of the request.
   Error UnloadModel(
-      const std::string& model_name, const Headers& headers = Headers());
+      const std::string& model_name, const Headers& headers = Headers(),
+      const uint64_t timeout_ms = 0);
 
   /// Contact the inference server and get the inference statistics for the
   /// specified model name and version.
@@ -267,11 +300,14 @@ class InferenceServerGrpcClient : public InferenceServerClient {
   /// choose a version based on the model and internal policy.
   /// \param headers Optional map specifying additional HTTP headers to include
   /// in the metadata of gRPC request.
-  /// \return Error object indicating success or failure of the request.
+  /// \param timeout_ms Optional timeout for API call, in microseconds, the
+  /// request is allowed to take.
+  /// \return Error object indicating success or
+  /// failure of the request.
   Error ModelInferenceStatistics(
       inference::ModelStatisticsResponse* infer_stat,
       const std::string& model_name = "", const std::string& model_version = "",
-      const Headers& headers = Headers());
+      const Headers& headers = Headers(), const uint64_t timeout_ms = 0);
 
   /// Update the trace settings for the specified model name, or global trace
   /// settings if model name is not given.
@@ -287,13 +323,16 @@ class InferenceServerGrpcClient : public InferenceServerClient {
   /// loading the model.
   /// \param headers Optional map specifying additional HTTP headers to include
   /// in the metadata of gRPC request.
-  /// \return Error object indicating success or failure of the request.
+  /// \param timeout_ms Optional timeout for API call, in microseconds, the
+  /// request is allowed to take.
+  /// \return Error object indicating success or
+  /// failure of the request.
   Error UpdateTraceSettings(
       inference::TraceSettingResponse* response,
       const std::string& model_name = "",
       const std::map<std::string, std::vector<std::string>>& settings =
           std::map<std::string, std::vector<std::string>>(),
-      const Headers& headers = Headers());
+      const Headers& headers = Headers(), const uint64_t timeout_ms = 0);
 
   /// Get the trace settings for the specified model name, or global trace
   /// settings if model name is not given.
@@ -303,10 +342,14 @@ class InferenceServerGrpcClient : public InferenceServerClient {
   /// will be returned.
   /// \param headers Optional map specifying additional HTTP headers to include
   /// in the metadata of gRPC request.
-  /// \return Error object indicating success or failure of the request.
+  /// \param timeout_ms Optional timeout for API call, in microseconds, the
+  /// request is allowed to take.
+  /// \return Error object indicating success or
+  /// failure of the request.
   Error GetTraceSettings(
       inference::TraceSettingResponse* settings,
-      const std::string& model_name = "", const Headers& headers = Headers());
+      const std::string& model_name = "", const Headers& headers = Headers(),
+      const uint64_t timeout_ms = 0);
 
   /// Contact the inference server and get the status for requested system
   /// shared memory.
@@ -317,10 +360,14 @@ class InferenceServerGrpcClient : public InferenceServerClient {
   /// shared memory will be returned.
   /// \param headers Optional map specifying additional HTTP headers to include
   /// in the metadata of gRPC request.
-  /// \return Error object indicating success or failure of the request.
+  /// \param timeout_ms Optional timeout for API call, in microseconds, the
+  /// request is allowed to take.
+  /// \return Error object indicating success or
+  /// failure of the request.
   Error SystemSharedMemoryStatus(
       inference::SystemSharedMemoryStatusResponse* status,
-      const std::string& region_name = "", const Headers& headers = Headers());
+      const std::string& region_name = "", const Headers& headers = Headers(),
+      const uint64_t timeout_ms = 0);
 
   /// Request the server to register a system shared memory with the provided
   /// details.
@@ -332,10 +379,14 @@ class InferenceServerGrpcClient : public InferenceServerClient {
   /// the start of the system shared memory region. The default value is zero.
   /// \param headers Optional map specifying additional HTTP headers to include
   /// in the metadata of gRPC request.
-  /// \return Error object indicating success or failure of the request
+  /// \param timeout_ms Optional timeout for API call, in microseconds, the
+  /// request is allowed to take.
+  /// \return Error object indicating success or
+  /// failure of the request
   Error RegisterSystemSharedMemory(
       const std::string& name, const std::string& key, const size_t byte_size,
-      const size_t offset = 0, const Headers& headers = Headers());
+      const size_t offset = 0, const Headers& headers = Headers(),
+      const uint64_t timeout_ms = 0);
 
   /// Request the server to unregister a system shared memory with the
   /// specified name.
@@ -344,9 +395,13 @@ class InferenceServerGrpcClient : public InferenceServerClient {
   /// unregistered.
   /// \param headers Optional map specifying additional HTTP headers to include
   /// in the metadata of gRPC request.
-  /// \return Error object indicating success or failure of the request
+  /// \param timeout_ms Optional timeout for API call, in microseconds, the
+  /// request is allowed to take.
+  /// \return Error object indicating success or
+  /// failure of the request
   Error UnregisterSystemSharedMemory(
-      const std::string& name = "", const Headers& headers = Headers());
+      const std::string& name = "", const Headers& headers = Headers(),
+      const uint64_t timeout_ms = 0);
 
   /// Contact the inference server and get the status for requested CUDA
   /// shared memory.
@@ -357,10 +412,14 @@ class InferenceServerGrpcClient : public InferenceServerClient {
   /// shared memory will be returned.
   /// \param headers Optional map specifying additional HTTP headers to include
   /// in the metadata of gRPC request.
-  /// \return Error object indicating success or failure of the request.
+  /// \param timeout_ms Optional timeout for API call, in microseconds, the
+  /// request is allowed to take.
+  /// \return Error object indicating success or
+  /// failure of the request.
   Error CudaSharedMemoryStatus(
       inference::CudaSharedMemoryStatusResponse* status,
-      const std::string& region_name = "", const Headers& headers = Headers());
+      const std::string& region_name = "", const Headers& headers = Headers(),
+      const uint64_t timeout_ms = 0);
 
   /// Request the server to register a CUDA shared memory with the provided
   /// details.
@@ -372,11 +431,14 @@ class InferenceServerGrpcClient : public InferenceServerClient {
   /// bytes.
   /// \param headers Optional map specifying additional HTTP headers to
   /// include in the metadata of gRPC request.
-  /// \return Error object indicating success or failure of the request
+  /// \param timeout_ms Optional timeout for API call, in microseconds, the
+  /// request is allowed to take.
+  /// \return Error object indicating success or
+  /// failure of the request
   Error RegisterCudaSharedMemory(
       const std::string& name, const cudaIpcMemHandle_t& cuda_shm_handle,
       const size_t device_id, const size_t byte_size,
-      const Headers& headers = Headers());
+      const Headers& headers = Headers(), const uint64_t timeout_ms = 0);
 
   /// Request the server to unregister a CUDA shared memory with the
   /// specified name.
@@ -385,9 +447,13 @@ class InferenceServerGrpcClient : public InferenceServerClient {
   /// unregistered.
   /// \param headers Optional map specifying additional HTTP headers to
   /// include in the metadata of gRPC request.
-  /// \return Error object indicating success or failure of the request
+  /// \param timeout_ms Optional timeout for API call, in microseconds, the
+  /// request is allowed to take.
+  /// \return Error object indicating success or
+  /// failure of the request
   Error UnregisterCudaSharedMemory(
-      const std::string& name = "", const Headers& headers = Headers());
+      const std::string& name = "", const Headers& headers = Headers(),
+      const uint64_t timeout_ms = 0);
 
   /// Run synchronous inference on server.
   /// \param result Returns the result of inference.
@@ -413,7 +479,7 @@ class InferenceServerGrpcClient : public InferenceServerClient {
   /// Run asynchronous inference on server.
   /// Once the request is completed, the InferResult pointer will be passed to
   /// the provided 'callback' function. Upon the invocation of callback
-  /// function, the ownership of InferResult object is transfered to the
+  /// function, the ownership of InferResult object is transferred to the
   /// function caller. It is then the caller's choice on either retrieving the
   /// results inside the callback function or deferring it to a different thread
   /// so that the client is unblocked. In order to prevent memory leak, user
@@ -466,7 +532,7 @@ class InferenceServerGrpcClient : public InferenceServerClient {
   /// Once all the requests are completed, the vector of InferResult pointers
   /// will be passed to the provided 'callback' function. Upon the invocation
   /// of callback function, the ownership of the InferResult objects are
-  /// transfered to the function caller. It is then the caller's choice on
+  /// transferred to the function caller. It is then the caller's choice on
   /// either retrieving the results inside the callback function or deferring it
   /// to a different thread so that the client is unblocked. In order to
   /// prevent memory leak, user must ensure these objects get deleted.
@@ -533,6 +599,9 @@ class InferenceServerGrpcClient : public InferenceServerClient {
       const InferOptions& options, const std::vector<InferInput*>& inputs,
       const std::vector<const InferRequestedOutput*>& outputs =
           std::vector<const InferRequestedOutput*>());
+
+  // Number of Cached Channels
+  size_t GetNumCachedChannels() const;
 
  private:
   InferenceServerGrpcClient(

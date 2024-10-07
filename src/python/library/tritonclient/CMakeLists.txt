@@ -1,4 +1,4 @@
-# Copyright (c) 2020, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2020-2023, NVIDIA CORPORATION. All rights reserved.
 #
 # Redistribution and use in source and binary forms, with or without
 # modification, are permitted provided that the following conditions
@@ -33,5 +33,11 @@ endif() # TRITON_ENABLE_PYTHON_HTTP
 if(${TRITON_ENABLE_PYTHON_GRPC})
   file(COPY grpc DESTINATION .)
 endif() # TRITON_ENABLE_PYTHON_GRPC
+
+file(COPY _client.py DESTINATION .)
+file(COPY _plugin.py DESTINATION .)
+file(COPY __init__.py DESTINATION .)
+file(COPY _request.py DESTINATION .)
+file(COPY _auth.py DESTINATION .)
 
 add_subdirectory(utils)

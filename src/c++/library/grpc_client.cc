@@ -1,4 +1,4 @@
-// Copyright 2020-2022, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// Copyright 2020-2023, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 //
 // Redistribution and use in source and binary forms, with or without
 // modification, are permitted provided that the following conditions
@@ -26,7 +26,7 @@
 
 // Include this first to make sure we are a friend of common classes.
 #define TRITON_INFERENCE_SERVER_CLIENT_CLASS InferenceServerGrpcClient
-#include "common.h"
+#include "grpc_client.h"
 
 #include <chrono>
 #include <cstdint>
@@ -35,7 +35,9 @@
 #include <iostream>
 #include <mutex>
 #include <sstream>
-#include "grpc_client.h"
+#include <string>
+
+#include "common.h"
 
 namespace triton { namespace client {
 namespace {
@@ -92,7 +94,7 @@ GetStub(
           "TRITON_CLIENT_GRPC_CHANNEL_MAX_SHARE_COUNT", "6"));
   const auto& channel_itr = grpc_channel_stub_map_.find(url);
   // Reuse cached channel if the channel is found in the map and
-  // used_cached_channel flag is true
+  // use_cached_channel flag is true
   if ((channel_itr != grpc_channel_stub_map_.end()) && use_cached_channel) {
     // check if NewStub should be created
     const auto& shared_count = std::get<0>(channel_itr->second);
@@ -133,15 +135,34 @@ GetStub(
       grpc::CreateCustomChannel(url, credentials, arguments);
   std::shared_ptr<inference::GRPCInferenceService::Stub> stub =
       inference::GRPCInferenceService::NewStub(channel);
-  // Replace if channel / stub have been in the map
-  if (channel_itr != grpc_channel_stub_map_.end()) {
-    channel_itr->second = std::make_tuple(1, channel, stub);
-  } else {
-    grpc_channel_stub_map_.insert(
-        std::make_pair(url, std::make_tuple(1, channel, stub)));
+
+  // If `use_cached_channel` is true, create no new channels even if there
+  // are no cached channels.
+  if (use_cached_channel) {
+    // Replace if channel / stub have been in the map
+    if (channel_itr != grpc_channel_stub_map_.end()) {
+      channel_itr->second = std::make_tuple(1, channel, stub);
+    } else {
+      grpc_channel_stub_map_.insert(
+          std::make_pair(url, std::make_tuple(1, channel, stub)));
+    }
   }
 
   return stub;
+}
+
+/// Set client timeout
+///
+/// \param client_timeout_ms Deadline for timeout in microseconds
+/// \param context Client context to add deadline to
+void
+SetTimeout(const uint64_t& client_timeout_ms, grpc::ClientContext* context)
+{
+  if (client_timeout_ms != 0) {
+    auto deadline = std::chrono::system_clock::now() +
+                    std::chrono::microseconds(client_timeout_ms);
+    context->set_deadline(deadline);
+  }
 }
 }  // namespace
 
@@ -188,6 +209,8 @@ class InferResultGrpc : public InferResult {
   Error RawData(
       const std::string& output_name, const uint8_t** buf,
       size_t* byte_size) const override;
+  Error IsFinalResponse(bool* is_final_response) const override;
+  Error IsNullResponse(bool* is_null_response) const override;
   Error StringData(
       const std::string& output_name,
       std::vector<std::string>* string_result) const override;
@@ -208,6 +231,8 @@ class InferResultGrpc : public InferResult {
   std::shared_ptr<inference::ModelInferResponse> response_;
   std::shared_ptr<inference::ModelStreamInferResponse> stream_response_;
   Error request_status_;
+  bool is_final_response_{true};
+  bool is_null_response_{false};
 };
 
 Error
@@ -310,6 +335,26 @@ InferResultGrpc::RawData(
 }
 
 Error
+InferResultGrpc::IsFinalResponse(bool* is_final_response) const
+{
+  if (is_final_response == nullptr) {
+    return Error("is_final_response cannot be nullptr");
+  }
+  *is_final_response = is_final_response_;
+  return Error::Success;
+}
+
+Error
+InferResultGrpc::IsNullResponse(bool* is_null_response) const
+{
+  if (is_null_response == nullptr) {
+    return Error("is_null_response cannot be nullptr");
+  }
+  *is_null_response = is_null_response_;
+  return Error::Success;
+}
+
+Error
 InferResultGrpc::StringData(
     const std::string& output_name,
     std::vector<std::string>* string_result) const
@@ -366,6 +411,12 @@ InferResultGrpc::InferResultGrpc(
         std::make_pair(output.name(), std::make_pair(buf, byte_size)));
     index++;
   }
+  const auto& is_final_response_itr{
+      response_->parameters().find("triton_final_response")};
+  if (is_final_response_itr != response_->parameters().end()) {
+    is_final_response_ = is_final_response_itr->second.bool_param();
+  }
+  is_null_response_ = response_->outputs().empty() && is_final_response_;
 }
 
 InferResultGrpc::InferResultGrpc(
@@ -386,6 +437,12 @@ InferResultGrpc::InferResultGrpc(
         std::make_pair(output.name(), std::make_pair(buf, byte_size)));
     index++;
   }
+  const auto& is_final_response_itr{
+      response_->parameters().find("triton_final_response")};
+  if (is_final_response_itr != response_->parameters().end()) {
+    is_final_response_ = is_final_response_itr->second.bool_param();
+  }
+  is_null_response_ = response_->outputs().empty() && is_final_response_;
 }
 
 //==============================================================================
@@ -441,7 +498,8 @@ InferenceServerGrpcClient::Create(
 }
 
 Error
-InferenceServerGrpcClient::IsServerLive(bool* live, const Headers& headers)
+InferenceServerGrpcClient::IsServerLive(
+    bool* live, const Headers& headers, const uint64_t timeout_ms)
 {
   Error err;
 
@@ -449,6 +507,7 @@ InferenceServerGrpcClient::IsServerLive(bool* live, const Headers& headers)
   inference::ServerLiveResponse response;
   grpc::ClientContext context;
 
+  SetTimeout(timeout_ms, &context);
   for (const auto& it : headers) {
     context.AddMetadata(it.first, it.second);
   }
@@ -467,7 +526,8 @@ InferenceServerGrpcClient::IsServerLive(bool* live, const Headers& headers)
 }
 
 Error
-InferenceServerGrpcClient::IsServerReady(bool* ready, const Headers& headers)
+InferenceServerGrpcClient::IsServerReady(
+    bool* ready, const Headers& headers, const uint64_t timeout_ms)
 {
   Error err;
 
@@ -475,6 +535,7 @@ InferenceServerGrpcClient::IsServerReady(bool* ready, const Headers& headers)
   inference::ServerReadyResponse response;
   grpc::ClientContext context;
 
+  SetTimeout(timeout_ms, &context);
   for (const auto& it : headers) {
     context.AddMetadata(it.first, it.second);
   }
@@ -495,7 +556,8 @@ InferenceServerGrpcClient::IsServerReady(bool* ready, const Headers& headers)
 Error
 InferenceServerGrpcClient::IsModelReady(
     bool* ready, const std::string& model_name,
-    const std::string& model_version, const Headers& headers)
+    const std::string& model_version, const Headers& headers,
+    const uint64_t timeout_ms)
 {
   Error err;
 
@@ -503,6 +565,7 @@ InferenceServerGrpcClient::IsModelReady(
   inference::ModelReadyResponse response;
   grpc::ClientContext context;
 
+  SetTimeout(timeout_ms, &context);
   for (const auto& it : headers) {
     context.AddMetadata(it.first, it.second);
   }
@@ -529,7 +592,8 @@ InferenceServerGrpcClient::IsModelReady(
 
 Error
 InferenceServerGrpcClient::ServerMetadata(
-    inference::ServerMetadataResponse* server_metadata, const Headers& headers)
+    inference::ServerMetadataResponse* server_metadata, const Headers& headers,
+    const uint64_t timeout_ms)
 {
   server_metadata->Clear();
   Error err;
@@ -537,6 +601,7 @@ InferenceServerGrpcClient::ServerMetadata(
   inference::ServerMetadataRequest request;
   grpc::ClientContext context;
 
+  SetTimeout(timeout_ms, &context);
   for (const auto& it : headers) {
     context.AddMetadata(it.first, it.second);
   }
@@ -559,7 +624,7 @@ Error
 InferenceServerGrpcClient::ModelMetadata(
     inference::ModelMetadataResponse* model_metadata,
     const std::string& model_name, const std::string& model_version,
-    const Headers& headers)
+    const Headers& headers, const uint64_t timeout_ms)
 {
   model_metadata->Clear();
   Error err;
@@ -567,6 +632,7 @@ InferenceServerGrpcClient::ModelMetadata(
   inference::ModelMetadataRequest request;
   grpc::ClientContext context;
 
+  SetTimeout(timeout_ms, &context);
   for (const auto& it : headers) {
     context.AddMetadata(it.first, it.second);
   }
@@ -590,7 +656,8 @@ InferenceServerGrpcClient::ModelMetadata(
 Error
 InferenceServerGrpcClient::ModelConfig(
     inference::ModelConfigResponse* model_config, const std::string& model_name,
-    const std::string& model_version, const Headers& headers)
+    const std::string& model_version, const Headers& headers,
+    const uint64_t timeout_ms)
 {
   model_config->Clear();
   Error err;
@@ -598,6 +665,7 @@ InferenceServerGrpcClient::ModelConfig(
   inference::ModelConfigRequest request;
   grpc::ClientContext context;
 
+  SetTimeout(timeout_ms, &context);
   for (const auto& it : headers) {
     context.AddMetadata(it.first, it.second);
   }
@@ -620,7 +688,7 @@ InferenceServerGrpcClient::ModelConfig(
 Error
 InferenceServerGrpcClient::ModelRepositoryIndex(
     inference::RepositoryIndexResponse* repository_index,
-    const Headers& headers)
+    const Headers& headers, const uint64_t timeout_ms)
 {
   repository_index->Clear();
   Error err;
@@ -628,6 +696,7 @@ InferenceServerGrpcClient::ModelRepositoryIndex(
   inference::RepositoryIndexRequest request;
   grpc::ClientContext context;
 
+  SetTimeout(timeout_ms, &context);
   for (const auto& it : headers) {
     context.AddMetadata(it.first, it.second);
   }
@@ -649,7 +718,8 @@ Error
 InferenceServerGrpcClient::LoadModel(
     const std::string& model_name, const Headers& headers,
     const std::string& config,
-    const std::map<std::string, std::vector<char>>& files)
+    const std::map<std::string, std::vector<char>>& files,
+    const uint64_t timeout_ms)
 {
   Error err;
 
@@ -657,6 +727,7 @@ InferenceServerGrpcClient::LoadModel(
   inference::RepositoryModelLoadResponse response;
   grpc::ClientContext context;
 
+  SetTimeout(timeout_ms, &context);
   for (const auto& it : headers) {
     context.AddMetadata(it.first, it.second);
   }
@@ -684,7 +755,8 @@ InferenceServerGrpcClient::LoadModel(
 
 Error
 InferenceServerGrpcClient::UnloadModel(
-    const std::string& model_name, const Headers& headers)
+    const std::string& model_name, const Headers& headers,
+    const uint64_t timeout_ms)
 {
   Error err;
 
@@ -692,6 +764,7 @@ InferenceServerGrpcClient::UnloadModel(
   inference::RepositoryModelUnloadResponse response;
   grpc::ClientContext context;
 
+  SetTimeout(timeout_ms, &context);
   for (const auto& it : headers) {
     context.AddMetadata(it.first, it.second);
   }
@@ -714,7 +787,7 @@ Error
 InferenceServerGrpcClient::ModelInferenceStatistics(
     inference::ModelStatisticsResponse* infer_stat,
     const std::string& model_name, const std::string& model_version,
-    const Headers& headers)
+    const Headers& headers, const uint64_t timeout_ms)
 {
   infer_stat->Clear();
   Error err;
@@ -722,6 +795,7 @@ InferenceServerGrpcClient::ModelInferenceStatistics(
   inference::ModelStatisticsRequest request;
   grpc::ClientContext context;
 
+  SetTimeout(timeout_ms, &context);
   for (const auto& it : headers) {
     context.AddMetadata(it.first, it.second);
   }
@@ -745,12 +819,13 @@ Error
 InferenceServerGrpcClient::UpdateTraceSettings(
     inference::TraceSettingResponse* response, const std::string& model_name,
     const std::map<std::string, std::vector<std::string>>& settings,
-    const Headers& headers)
+    const Headers& headers, const uint64_t timeout_ms)
 {
   inference::TraceSettingRequest request;
   grpc::ClientContext context;
   Error err;
 
+  SetTimeout(timeout_ms, &context);
   for (const auto& it : headers) {
     context.AddMetadata(it.first, it.second);
   }
@@ -785,7 +860,7 @@ InferenceServerGrpcClient::UpdateTraceSettings(
 Error
 InferenceServerGrpcClient::GetTraceSettings(
     inference::TraceSettingResponse* settings, const std::string& model_name,
-    const Headers& headers)
+    const Headers& headers, const uint64_t timeout_ms)
 {
   settings->Clear();
   Error err;
@@ -793,6 +868,7 @@ InferenceServerGrpcClient::GetTraceSettings(
   inference::TraceSettingRequest request;
   grpc::ClientContext context;
 
+  SetTimeout(timeout_ms, &context);
   for (const auto& it : headers) {
     context.AddMetadata(it.first, it.second);
   }
@@ -815,7 +891,8 @@ InferenceServerGrpcClient::GetTraceSettings(
 Error
 InferenceServerGrpcClient::SystemSharedMemoryStatus(
     inference::SystemSharedMemoryStatusResponse* status,
-    const std::string& region_name, const Headers& headers)
+    const std::string& region_name, const Headers& headers,
+    const uint64_t timeout_ms)
 {
   status->Clear();
   Error err;
@@ -823,6 +900,7 @@ InferenceServerGrpcClient::SystemSharedMemoryStatus(
   inference::SystemSharedMemoryStatusRequest request;
   grpc::ClientContext context;
 
+  SetTimeout(timeout_ms, &context);
   for (const auto& it : headers) {
     context.AddMetadata(it.first, it.second);
   }
@@ -844,7 +922,7 @@ InferenceServerGrpcClient::SystemSharedMemoryStatus(
 Error
 InferenceServerGrpcClient::RegisterSystemSharedMemory(
     const std::string& name, const std::string& key, const size_t byte_size,
-    const size_t offset, const Headers& headers)
+    const size_t offset, const Headers& headers, const uint64_t timeout_ms)
 {
   Error err;
 
@@ -852,6 +930,7 @@ InferenceServerGrpcClient::RegisterSystemSharedMemory(
   inference::SystemSharedMemoryRegisterResponse response;
   grpc::ClientContext context;
 
+  SetTimeout(timeout_ms, &context);
   for (const auto& it : headers) {
     context.AddMetadata(it.first, it.second);
   }
@@ -876,7 +955,7 @@ InferenceServerGrpcClient::RegisterSystemSharedMemory(
 
 Error
 InferenceServerGrpcClient::UnregisterSystemSharedMemory(
-    const std::string& name, const Headers& headers)
+    const std::string& name, const Headers& headers, const uint64_t timeout_ms)
 {
   Error err;
 
@@ -884,6 +963,7 @@ InferenceServerGrpcClient::UnregisterSystemSharedMemory(
   inference::SystemSharedMemoryUnregisterResponse response;
   grpc::ClientContext context;
 
+  SetTimeout(timeout_ms, &context);
   for (const auto& it : headers) {
     context.AddMetadata(it.first, it.second);
   }
@@ -911,7 +991,8 @@ InferenceServerGrpcClient::UnregisterSystemSharedMemory(
 Error
 InferenceServerGrpcClient::CudaSharedMemoryStatus(
     inference::CudaSharedMemoryStatusResponse* status,
-    const std::string& region_name, const Headers& headers)
+    const std::string& region_name, const Headers& headers,
+    const uint64_t timeout_ms)
 {
   status->Clear();
   Error err;
@@ -919,6 +1000,7 @@ InferenceServerGrpcClient::CudaSharedMemoryStatus(
   inference::CudaSharedMemoryStatusRequest request;
   grpc::ClientContext context;
 
+  SetTimeout(timeout_ms, &context);
   for (const auto& it : headers) {
     context.AddMetadata(it.first, it.second);
   }
@@ -940,7 +1022,8 @@ InferenceServerGrpcClient::CudaSharedMemoryStatus(
 Error
 InferenceServerGrpcClient::RegisterCudaSharedMemory(
     const std::string& name, const cudaIpcMemHandle_t& cuda_shm_handle,
-    const size_t device_id, const size_t byte_size, const Headers& headers)
+    const size_t device_id, const size_t byte_size, const Headers& headers,
+    const uint64_t timeout_ms)
 {
   Error err;
 
@@ -948,6 +1031,7 @@ InferenceServerGrpcClient::RegisterCudaSharedMemory(
   inference::CudaSharedMemoryRegisterResponse response;
   grpc::ClientContext context;
 
+  SetTimeout(timeout_ms, &context);
   for (const auto& it : headers) {
     context.AddMetadata(it.first, it.second);
   }
@@ -972,13 +1056,15 @@ InferenceServerGrpcClient::RegisterCudaSharedMemory(
 
 Error
 InferenceServerGrpcClient::UnregisterCudaSharedMemory(
-    const std::string& name, const Headers& headers)
+    const std::string& name, const Headers& headers, const uint64_t timeout_ms)
 {
   Error err;
 
   inference::CudaSharedMemoryUnregisterRequest request;
   inference::CudaSharedMemoryUnregisterResponse response;
   grpc::ClientContext context;
+
+  SetTimeout(timeout_ms, &context);
 
   for (const auto& it : headers) {
     context.AddMetadata(it.first, it.second);
@@ -1026,9 +1112,7 @@ InferenceServerGrpcClient::Infer(
   }
 
   if (options.client_timeout_ != 0) {
-    auto deadline = std::chrono::system_clock::now() +
-                    std::chrono::microseconds(options.client_timeout_);
-    context.set_deadline(deadline);
+    SetTimeout(options.client_timeout_, &context);
   }
   context.set_compression_algorithm(compression_algorithm);
 
@@ -1090,9 +1174,7 @@ InferenceServerGrpcClient::AsyncInfer(
   }
 
   if (options.client_timeout_ != 0) {
-    auto deadline = std::chrono::system_clock::now() +
-                    std::chrono::microseconds(options.client_timeout_);
-    async_request->grpc_context_.set_deadline(deadline);
+    SetTimeout(options.client_timeout_, &(async_request->grpc_context_));
   }
   async_request->grpc_context_.set_compression_algorithm(compression_algorithm);
 
@@ -1262,9 +1344,7 @@ InferenceServerGrpcClient::StartStream(
   }
 
   if (stream_timeout != 0) {
-    auto deadline = std::chrono::system_clock::now() +
-                    std::chrono::microseconds(stream_timeout);
-    grpc_context_.set_deadline(deadline);
+    SetTimeout(stream_timeout, &grpc_context_);
   }
   grpc_context_.set_compression_algorithm(compression_algorithm);
 
@@ -1346,6 +1426,8 @@ InferenceServerGrpcClient::PreRunProcessing(
   infer_request_.set_id(options.request_id_);
 
   infer_request_.mutable_parameters()->clear();
+  (*infer_request_.mutable_parameters())["triton_enable_empty_final_response"]
+      .set_bool_param(options.triton_enable_empty_final_response_);
   if ((options.sequence_id_ != 0) || (options.sequence_id_str_ != "")) {
     if (options.sequence_id_ != 0) {
       (*infer_request_.mutable_parameters())["sequence_id"].set_int64_param(
@@ -1360,13 +1442,30 @@ InferenceServerGrpcClient::PreRunProcessing(
         options.sequence_end_);
   }
   if (options.priority_ != 0) {
-    (*infer_request_.mutable_parameters())["priority"].set_int64_param(
+    (*infer_request_.mutable_parameters())["priority"].set_uint64_param(
         options.priority_);
   }
 
   if (options.server_timeout_ != 0) {
     (*infer_request_.mutable_parameters())["timeout"].set_int64_param(
         options.server_timeout_);
+  }
+
+
+  for (auto& param : options.request_parameters) {
+    if (param.second.type == "string") {
+      (*infer_request_.mutable_parameters())[param.first].set_string_param(
+          param.second.value);
+    } else if (param.second.type == "int") {
+      (*infer_request_.mutable_parameters())[param.first].set_int64_param(
+          std::stoi(param.second.value));
+    } else if (param.second.type == "bool") {
+      bool val = false;
+      if (param.second.value == "true") {
+        val = true;
+      }
+      (*infer_request_.mutable_parameters())[param.first].set_bool_param(val);
+    }
   }
 
   int index = 0;
@@ -1607,6 +1706,13 @@ InferenceServerGrpcClient::~InferenceServerGrpcClient()
   } while (has_next);
 
   StopStream();
+}
+
+size_t
+InferenceServerGrpcClient::GetNumCachedChannels() const
+{
+  std::lock_guard<std::mutex> lock(grpc_channel_stub_map_mtx_);
+  return grpc_channel_stub_map_.size();
 }
 
 //==============================================================================

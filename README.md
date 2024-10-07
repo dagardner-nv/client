@@ -1,5 +1,5 @@
 <!--
-# Copyright 2021-2022, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright 2021-2023, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 #
 # Redistribution and use in source and binary forms, with or without
 # modification, are permitted provided that the following conditions
@@ -35,7 +35,7 @@ several client libraries and examples of how to use those
 libraries. Ask questions or report problems in the main Triton [issues
 page](https://github.com/triton-inference-server/server/issues).
 
-The provided client libaries are:
+The provided client libraries are:
 
 * [C++ and Python APIs](#client-library-apis) that make it easy to
   communicate with Triton from your C++ or Python application. Using
@@ -62,7 +62,7 @@ The provided client libaries are:
 
 There are also many example applications that show how to use these
 libraries. Many of these examples use models from the [example model
-repository](https://github.com/triton-inference-server/server/blob/master/docs/quickstart.md#create-a-model-repository).
+repository](https://github.com/triton-inference-server/server/blob/main/docs/getting_started/quickstart.md#create-a-model-repository).
 
 * C++ and Python versions of *image_client*, an example application
   that uses the C++ or Python client library to execute image
@@ -130,30 +130,25 @@ use,
 $ pip install tritonclient[http]
 ```
 
+There is another optional package namely *cuda*, that must be installed
+in order to use cuda_shared_memory utilities. *all* specification will
+install the *cuda* package by default but in other cases *cuda* needs to
+be explicitly specified for installing client with cuda_shared_memory
+support.
+
+```
+$ pip install tritonclient[http, cuda]
+```
+
 The components of the install packages are:
 
 * http
 * grpc [ `service_pb2`, `service_pb2_grpc`, `model_config_pb2` ]
 * utils [ linux distribution will include `shared_memory` and `cuda_shared_memory`]
 
-The Linux version of the package also includes the
-[perf_analyzer](https://github.com/triton-inference-server/server/blob/master/docs/perf_analyzer.md)
-binary. The perf_analyzer binary is built on Ubuntu 20.04 and may not
-run on other Linux distributions. To run the perf_analyzer the
-following dependency must be installed:
-
-```bash
-$ sudo apt update
-$ sudo apt install libb64-dev
-```
-
-To reiterate, the installation on windows will not include perf_analyzer
-nor shared_memory/cuda_shared_memory components.
-
 ### Download From GitHub
 
-The client libraries and the perf_analyzer executable can be
-downloaded from the [Triton GitHub release
+The client libraries can be downloaded from the [Triton GitHub release
 page](https://github.com/triton-inference-server/server/releases)
 corresponding to the release you are interested in. The client
 libraries are found in the "Assets" section of the release page in a
@@ -175,15 +170,6 @@ After installing, the libraries can be found in lib/, the headers in
 include/, the Python wheel files in python/, and the jar files in
 java/.  The bin/ and python/ directories contain the built examples
 that you can learn more about below.
-
-The perf_analyzer binary is built on Ubuntu 20.04 and may not run on
-other Linux distributions. To use the C++ libraries or perf_analyzer
-executable you must install some dependencies.
-
-```bash
-$ apt-get update
-$ apt-get install curl libcurl4-openssl-dev libb64-dev
-```
 
 ### Download Docker Image From NGC
 
@@ -214,7 +200,7 @@ you need to add `--pid host` flag when launching the containers. The reason is
 that CUDA IPC APIs require the PID of the source and destination of the exported
 pointer to be different. Otherwise, Docker enables PID namespace which may
 result in equality between the source and destination PIDs. The error will be
-always observed when both of the containers are started in the non-interacive
+always observed when both of the containers are started in the non-interactive
 mode.
 
 ### Build Using CMake
@@ -244,17 +230,6 @@ because Triton on Windows does not yet support all the build options.
 
 Use *cmake* to configure the build. You should adjust the flags depending on
 the components of Triton Client you are working and would like to build.
-For example, if you want to build Perf Analyzer with Triton C API, you can use \
-`-DTRITON_ENABLE_PERF_ANALYZER=ON -DTRITON_ENABLE_PERF_ANALYZER_C_API=ON`. You can
-also use `TRITON_ENABLE_PERF_ANALYZER_TFS` and `TRITON_ENABLE_PERF_ANALYZER_TS` flags
-to enable/disable support for TensorFlow Serving and TorchServe backend respectively in perf analyzer. \
-The following command demonstrate how to build client with all the features:
-
-```
-$ mkdir build
-$ cd build
-$ cmake -DCMAKE_INSTALL_PREFIX=`pwd`/install -DTRITON_ENABLE_CC_HTTP=ON -DTRITON_ENABLE_CC_GRPC=ON -DTRITON_ENABLE_PERF_ANALYZER=ON -DTRITON_ENABLE_PERF_ANALYZER_C_API=ON -DTRITON_ENABLE_PERF_ANALYZER_TFS=ON -DTRITON_ENABLE_PERF_ANALYZER_TS=ON -DTRITON_ENABLE_PYTHON_HTTP=ON -DTRITON_ENABLE_PYTHON_GRPC=ON -DTRITON_ENABLE_JAVA_HTTP=ON -DTRITON_ENABLE_GPU=ON -DTRITON_ENABLE_EXAMPLES=ON -DTRITON_ENABLE_TESTS=ON ..
-```
 
 If you are building on a release branch (or on a development branch
 that is based off of a release branch), then you must also use
@@ -267,7 +242,6 @@ cmake flags:
 -DTRITON_COMMON_REPO_TAG=r21.10
 -DTRITON_THIRD_PARTY_REPO_TAG=r21.10
 -DTRITON_CORE_REPO_TAG=r21.10
--DTRITON_BACKEND_REPO_TAG=r21.10
 ```
 
 Then use *make* to build the clients and examples.
@@ -284,7 +258,7 @@ the install directory.
 To build the clients you must install an appropriate C++ compiler and
 other dependencies required for the build. The easiest way to do this
 is to create the [Windows min Docker
-image](https://github.com/triton-inference-server/server/blob/master/docs/build.md#windows-10-min-container)
+image](https://github.com/triton-inference-server/server/blob/main/docs/customization_guide/build.md#windows-10-min-image)
 and the perform the build within a container launched from that image.
 
 ```
@@ -316,7 +290,6 @@ cmake flags:
 -DTRITON_COMMON_REPO_TAG=r21.10
 -DTRITON_THIRD_PARTY_REPO_TAG=r21.10
 -DTRITON_CORE_REPO_TAG=r21.10
--DTRITON_BACKEND_REPO_TAG=r21.10
 ```
 
 Then use msbuild.exe to build.
@@ -351,7 +324,7 @@ to the [Java client directory](src/java).
 
 #### SSL/TLS
 
-The client library allows communication across a secured channel using HTTPS protocol. Just setting these SSL options do not ensure the secure communication. Triton server should be running behind `https://` proxy such as nginx. The client can then establish a secure channel to the proxy. The [`qa/L0_https`](https://github.com/triton-inference-server/server/blob/main/qa/L0_https/test.sh) in the server repository demonstrates how this can be acheived. 
+The client library allows communication across a secured channel using HTTPS protocol. Just setting these SSL options do not ensure the secure communication. Triton server should be running behind `https://` proxy such as nginx. The client can then establish a secure channel to the proxy. The [`qa/L0_https`](https://github.com/triton-inference-server/server/blob/main/qa/L0_https/test.sh) in the server repository demonstrates how this can be achieved.
 
 For C++ client, see `HttpSslOptions` struct that encapsulates these options in [http_client.h](src/c%2B%2B/library/http_client.h).
 
@@ -372,7 +345,7 @@ The client library enables on-wire compression for HTTP transactions.
 
 For C++ client, see `request_compression_algorithm` and `response_compression_algorithm` parameters in the `Infer` and `AsyncInfer` functions in [http_client.h](src/c%2B%2B/library/http_client.h). By default, the parameter is set as `CompressionType::NONE`.
 
-Similarly, for Python client, see `request_compression_algorithm` and `response_compression_algorithm` parameters in `infer`and `async_infer` functions in [http/\_\_init\_\_.py](src/python/library/tritonclient/http/__init__.py).
+Similarly, for Python client, see `request_compression_algorithm` and `response_compression_algorithm` parameters in `infer` and `async_infer` functions in [http/\_\_init\_\_.py](src/python/library/tritonclient/http/__init__.py).
 
 The [C++](src/c%2B%2B/examples/simple_http_infer_client.cc) and [Python](src/python/examples/simple_http_infer_client.py) examples demonstrates how to use compression options.
 
@@ -381,12 +354,79 @@ The [C++](src/c%2B%2B/examples/simple_http_infer_client.cc) and [Python](src/pyt
 *This feature is currently in beta and may be subject to change.*
 
 Advanced users may call the Python client via `async` and `await` syntax. The
-[infer](src/python/examples/simple_http_aio_infer_client.py) example 
+[infer](src/python/examples/simple_http_aio_infer_client.py) example
 demonstrates how to infer with AsyncIO.
 
-If using SSL/TLS with AsyncIO, look for the `ssl` and `ssl_context` options in 
+If using SSL/TLS with AsyncIO, look for the `ssl` and `ssl_context` options in
 [http/aio/\_\_init\_\_.py](src/python/library/tritonclient/http/aio/__init__.py)
 
+#### Python Client Plugin API (Beta)
+
+*This feature is currently in beta and may be subject to change.*
+
+
+The Triton Client Plugin API lets you register custom plugins to add or modify
+request headers. This is useful if you have gateway in front of Triton Server
+that requires extra headers for each request, such as HTTP Authorization. By
+registering the plugin, your gateway will work with Python clients without
+additional configuration. Note that Triton Server does not implement
+authentication or authorization mechanisms  and similarly,
+Triton Server is not the direct consumer of the additional headers.
+
+The plugin must implement the `__call__` method. The signature
+of the `__call__` method should look like below:
+
+```python
+class MyPlugin:
+  def __call__(self, request):
+       """This method will be called for every HTTP request. Currently, the only
+       field that can be accessed by the request object is the `request.headers`
+       field. This field must be updated in-place.
+       """
+       request.headers['my-header-key'] = 'my-header-value'
+```
+
+After the plugin implementation is complete, you can register the
+plugin by calling `register` on the `InferenceServerClient` object.
+
+```python
+from tritonclient.http import InferenceServerClient
+
+client = InferenceServerClient(...)
+
+# Register the plugin
+my_plugin = MyPlugin()
+client.register_plugin(my_plugin)
+
+# All the method calls will update the headers according to the plugin
+# implementation.
+client.infer(...)
+```
+
+To unregister the plugin, you can call the `client.unregister_plugin()`
+function.
+
+##### Basic Auth
+
+You can register the `BasicAuth` plugin that implements
+[Basic Authentication](https://en.wikipedia.org/wiki/Basic_access_authentication).
+
+
+```python
+from tritonclient.grpc.auth import BasicAuth
+from tritonclient.grpc import InferenceServerClient
+
+basic_auth = BasicAuth('username', 'password')
+client = InferenceServerClient('...')
+
+client.register_plugin(basic_auth)
+```
+
+The example above shows how to register the plugin for
+gRPC client. The `BasicAuth` plugin can be registered
+similarly for HTTP and
+[AsyncIO](#python-asyncio-support-beta)
+clients.
 ### GRPC Options
 
 #### SSL/TLS
@@ -403,18 +443,18 @@ For Python client, look for the following options in [grpc/\_\_init\_\_.py](src/
 * certificate_chain
 
 The [C++](src/c%2B%2B/examples/simple_grpc_infer_client.cc) and [Python](src/python/examples/simple_grpc_infer_client.py) examples
-demonstrates how to use SSL/TLS settings on client side. For information on the corresponding server-side parameters, refer to the 
-[server documentation](https://github.com/triton-inference-server/server/blob/main/docs/inference_protocols.md#ssltls)
+demonstrates how to use SSL/TLS settings on client side. For information on the corresponding server-side parameters, refer to the
+[server documentation](https://github.com/triton-inference-server/server/blob/main/docs/customization_guide/inference_protocols.md#ssltls)
 
 #### Compression
 
-The client library also exposes options to use on-wire compression for gRPC transactions. 
+The client library also exposes options to use on-wire compression for gRPC transactions.
 
 For C++ client, see `compression_algorithm` parameter in the `Infer`, `AsyncInfer` and `StartStream` functions in [grpc_client.h](src/c%2B%2B/library/grpc_client.h). By default, the parameter is set as `GRPC_COMPRESS_NONE`.
 
 Similarly, for Python client, see `compression_algorithm` parameter in `infer`, `async_infer` and `start_stream` functions in [grpc/\_\_init\_\_.py](src/python/library/tritonclient/grpc/__init__.py).
 
-The [C++](src/c%2B%2B/examples/simple_grpc_infer_client.cc) and [Python](src/python/examples/simple_grpc_infer_client.py) examples demonstrates how to configure compression for clients. For information on the corresponding server-side parameters, refer to the [server documentation](https://github.com/triton-inference-server/server/blob/main/docs/inference_protocols.md#compression).
+The [C++](src/c%2B%2B/examples/simple_grpc_infer_client.cc) and [Python](src/python/examples/simple_grpc_infer_client.py) examples demonstrates how to configure compression for clients. For information on the corresponding server-side parameters, refer to the [server documentation](https://github.com/triton-inference-server/server/blob/main/docs/customization_guide/inference_protocols.md#compression).
 
 #### GRPC KeepAlive
 
@@ -428,8 +468,8 @@ parameters in both the [C++](src/c%2B%2B/library/grpc_client.h) and
 There is also a [C++](src/c%2B%2B/examples/simple_grpc_keepalive_client.cc) and
 [Python](src/python/examples/simple_grpc_keepalive_client.py) example
 demonstrating how to setup these parameters on the client-side. For information
-on the corresponding server-side parameters, refer to the 
-[server documentation](https://github.com/triton-inference-server/server/blob/main/docs/inference_protocols.md#grpc-keepalive)
+on the corresponding server-side parameters, refer to the
+[server documentation](https://github.com/triton-inference-server/server/blob/main/docs/customization_guide/inference_protocols.md#grpc-keepalive)
 
 #### Custom GRPC Channel Arguments
 
@@ -437,10 +477,10 @@ Advanced users may require specific client-side GRPC Channel Arguments that are
 not currently exposed by Triton through direct means. To support this, Triton
 allows users to pass custom channel arguments upon creating a GRPC client. When
 using this option, it is up to the user to pass a valid combination of arguments
-for their use case; Triton cannot feasibly test every posisble combination of
+for their use case; Triton cannot feasibly test every possible combination of
 channel arguments.
 
-There is a [C++](src/c%2B%2B/examples/simple_grpc_custom_args_client.cc) and 
+There is a [C++](src/c%2B%2B/examples/simple_grpc_custom_args_client.cc) and
 [Python](src/python/examples/simple_grpc_custom_args_client.py) example
 demonstrating how to construct and pass these custom arguments upon creating
 a GRPC client.
@@ -452,11 +492,86 @@ You can find a comprehensive list of possible GRPC Channel Arguments
 
 *This feature is currently in beta and may be subject to change.*
 
-Advanced users may call the Python client via `async` and `await` syntax. The 
-[infer](src/python/examples/simple_grpc_aio_infer_client.py) and 
-[stream](src/python/examples/simple_grpc_aio_sequence_stream_infer_client.py) 
+Advanced users may call the Python client via `async` and `await` syntax. The
+[infer](src/python/examples/simple_grpc_aio_infer_client.py) and
+[stream](src/python/examples/simple_grpc_aio_sequence_stream_infer_client.py)
 examples demonstrate how to infer with AsyncIO.
 
+
+### Request Cancellation
+
+Starting from r23.10, triton python gRPC client can issue cancellation
+to inflight requests. This can be done by calling `cancel()` on the
+CallContext object returned by `async_infer()` API.
+
+```python
+  ctx = client.async_infer(...)
+  ctx.cancel()
+```
+
+For streaming requests, `cancel_requests=True` can be sent to
+`stop_stream()` API to terminate all the inflight requests
+sent via this stream.
+
+```python
+  client.start_stream()
+  for _ in range(10):
+    client.async_stream_infer(...)
+
+  # Cancels all pending requests on stream closure rather than blocking until requests complete
+  client.stop_stream(cancel_requests=True)
+```
+
+See more details about these APIs in
+[grpc/\_client.py](src/python/library/tritonclient/grpc/_client.py).
+
+For gRPC AsyncIO requests, an AsyncIO task wrapping an `infer()` coroutine can
+be safely cancelled.
+
+```python
+  infer_task = asyncio.create_task(aio_client.infer(...))
+  infer_task.cancel()
+```
+
+For gRPC AsyncIO streaming requests, `cancel()` can be called on the
+asynchronous iterator returned by `stream_infer()` API.
+
+```python
+  responses_iterator = aio_client.stream_infer(...)
+  responses_iterator.cancel()
+```
+
+See more details about these APIs in
+[grpc/aio/\__init__.py](src/python/library/tritonclient/grpc/aio/__init__.py).
+
+See [request_cancellation](https://github.com/triton-inference-server/server/blob/main/docs/user_guide/request_cancellation.md)
+in the server user-guide to learn about how this is handled on the
+server side.
+If writing your own gRPC clients in the language of choice consult
+gRPC guide on [cancellation](https://grpc.io/docs/guides/cancellation/#cancelling-an-rpc-call-on-the-client-side).
+
+### GRPC Status Codes
+
+Starting from release 24.08, Triton server introduces support for gRPC error
+codes in streaming mode for all clients enhancing error reporting capabilities. When
+this feature is enabled, the Triton server will return standard gRPC error codes
+and subsequently close the stream after delivering the error. This feature is
+optional can be enabled by adding header with `triton_grpc_error` key and `true` as
+value. See [grpc error
+codes](https://github.com/triton-inference-server/server/tree/main#GRPC-Status-Codes) in the server to learn about how this is handled on the server side. See gRPC
+guide on [status-codes](https://grpc.io/docs/guides/status-codes/) for more details.
+Below is a Python snippet to enable the feature. Without this header Triton server
+will continue streaming in default mode returning error message and status inside
+`InferenceServerException` object within the callback provided.
+
+```python
+  triton_client = grpcclient.InferenceServerClient(triton_server_url)
+  # New added header key value
+  metadata = {"triton_grpc_error": "true"}
+  triton_client.start_stream(
+    callback=partial(callback, user_data), headers=metadata
+  )
+```
 ## Simple Example Applications
 
 This section describes several of the simple example applications and
@@ -467,7 +582,7 @@ the features that they illustrate.
 Some frameworks support tensors where each element in the tensor is
 variable-length binary data. Each element can hold a string or an
 arbitrary sequence of bytes. On the client this datatype is BYTES (see
-[Datatypes](https://github.com/triton-inference-server/server/blob/master/docs/model_configuration.md#datatypes)
+[Datatypes](https://github.com/triton-inference-server/server/blob/main/docs/user_guide/model_configuration.md#datatypes)
 for information on supported datatypes).
 
 The Python client library uses numpy to represent input and output
@@ -518,12 +633,14 @@ Python does not have a standard way of allocating and accessing shared
 memory so as an example a simple [CUDA shared memory
 module](src/python/library/tritonclient/utils/cuda_shared_memory)
 is provided that can be used with the Python client library to create,
-set and destroy CUDA shared memory.
+set and destroy CUDA shared memory. The module currently supports
+numpy arrays ([example usage](src/python/examples/simple_http_cudashm_client.py))
+and DLPack tensors ([example usage](src/python/library/tests/test_dlpack.py)).
 
 ### Client API for Stateful Models
 
 When performing inference using a [stateful
-model](https://github.com/triton-inference-server/server/blob/master/docs/architecture.md#stateful-models),
+model](https://github.com/triton-inference-server/server/blob/main/docs/user_guide/architecture.md#stateful-models),
 a client must identify which inference requests belong to the same
 sequence and also when a sequence starts and ends.
 
@@ -534,11 +651,9 @@ should be marked as the start of the sequence and the last inference
 requests should be marked as the end of the sequence.
 
 The use of sequence ID and start and end flags are demonstrated in the
-C++ example applications simple_http_sequence_stream_infer_client.cc
-and simple_grpc_sequence_stream_infer_client.cc.  The use of sequence
-ID and start and end flags are demonstrated in the Python example
-application simple_http_sequence_stream_infer_client.py and
-simple_grpc_sequence_stream_infer_client.py.
+C++ example applications simple_grpc_sequence_stream_infer_client.cc.
+The use of sequence ID and start and end flags are demonstrated in the
+Python example application simple_grpc_sequence_stream_infer_client.py.
 
 ## Image Classification Example
 
@@ -553,14 +668,14 @@ Triton that is serving one or more image classification models. The
 image_client application requires that the model have a single image
 input and produce a single classification output. If you don't have a
 model repository with image classification models see
-[QuickStart](https://github.com/triton-inference-server/server/blob/master/docs/quickstart.md)
+[QuickStart](https://github.com/triton-inference-server/server/blob/main/docs/getting_started/quickstart.md)
 for instructions on how to create one.
 
 Once Triton is running you can use the image_client application to
 send inference requests. You can specify a single image or a directory
 holding images. Here we send a request for the inception_graphdef
 model for an image from the
-[qa/images](https://github.com/triton-inference-server/server/tree/master/qa/images).
+[qa/images](https://github.com/triton-inference-server/server/tree/main/qa/images).
 
 ```bash
 $ image_client -m inception_graphdef -s INCEPTION qa/images/mug.jpg
